@@ -100,18 +100,32 @@ var _ = Describe("artist", func() {
 			Expect(id).To(Equal(int64(0)))
 		})
 
-		It("caches a negative result on API-level errors (deliberate throttling)", func() {
+		It("returns error without negative-caching on rate-limit codes", func() {
 			host.KVStoreMock.On("Get", "artist:unlucky").Return([]byte(nil), false, nil)
 			mockAPIConfig()
 
-			// e.g. rate limited: HTTP 200 but API code != 200
+			// HTTP 200 but API code 460 (rate limited): retried across mirrors
+			// inside apiGet; with a single mirror it surfaces as an error.
 			mockHTTPJSON("/search?keywords=", neteaseArtistSearchResponse{Code: 460})
 
-			host.KVStoreMock.On("SetWithTTL", "artist:unlucky",
-				mustMarshal(cachedArtistID{ArtistID: 0}), int64(negativeCacheTTLSeconds)).Return(nil)
+			// No SetWithTTL expectation: rate limiting must NOT be cached as
+			// "not found". (An unexpected SetWithTTL call would panic the mock.)
 
 			id, err := resolveArtistID("Unlucky")
-			Expect(err).ToNot(HaveOccurred())
+			Expect(err).To(HaveOccurred())
+			Expect(id).To(Equal(int64(0)))
+		})
+
+		It("returns error without negative-caching on other API-level codes", func() {
+			host.KVStoreMock.On("Get", "artist:weird").Return([]byte(nil), false, nil)
+			mockAPIConfig()
+
+			// Non-retryable API code (e.g. 500-class upstream error) reaches the
+			// caller: error out, do not negative-cache.
+			mockHTTPJSON("/search?keywords=", neteaseArtistSearchResponse{Code: 500})
+
+			id, err := resolveArtistID("Weird")
+			Expect(err).To(HaveOccurred())
 			Expect(id).To(Equal(int64(0)))
 		})
 

@@ -37,15 +37,27 @@ func getAPIEndpoints() []string {
 // errNoAPIEndpoint is returned by apiGet when no API endpoint is configured.
 var errNoAPIEndpoint = errors.New("api_endpoints not configured: set at least one API endpoint in the plugin settings")
 
-// randomAPIEndpoint picks one of the configured endpoints at random, so
-// multiple configured mirrors share the request load. Returns "" when no
-// endpoint is configured.
-func randomAPIEndpoint() string {
+// retryableAPICodes are Netease API-level codes worth retrying on another
+// mirror: rate limiting is enforced per source IP, so a mirror returning one
+// of these may be throttled while another is not.
+var retryableAPICodes = map[int]bool{
+	405: true, // frequency limit
+	429: true, // too many requests
+	460: true, // operation too frequent ("cheating")
+	462: true, // temporarily unavailable due to frequency
+}
+
+// shuffledAPIEndpoints returns all configured endpoints in random order, so
+// load is spread across mirrors while apiGet can fall through to the next one
+// on failure. Returns nil when no endpoint is configured.
+func shuffledAPIEndpoints() []string {
 	endpoints := getAPIEndpoints()
-	if len(endpoints) == 0 {
-		return ""
+	perm := rand.Perm(len(endpoints))
+	out := make([]string, 0, len(endpoints))
+	for _, i := range perm {
+		out = append(out, endpoints[i])
 	}
-	return endpoints[rand.IntN(len(endpoints))]
+	return out
 }
 
 // getMusicU returns the configured Netease MUSIC_U cookie value, or "" when
@@ -60,40 +72,58 @@ func getMusicU() string {
 }
 
 // apiGet fetches a Netease Cloud Music API path (e.g. "/artist/detail?id=123")
-// from a randomly picked configured endpoint and unmarshals the JSON body into
-// target. When a MUSIC_U cookie is configured it is passed via the `cookie`
+// from the configured endpoints and unmarshals the JSON body into target.
+// Endpoints are tried in random order: when a mirror is unreachable (transport
+// error or non-200 HTTP status) or rate-limited (API code in retryableAPICodes)
+// the next mirror is tried, and only when every mirror fails is an error
+// returned. When a MUSIC_U cookie is configured it is passed via the `cookie`
 // query parameter, which the API service forwards to Netease. Callers must
-// check the response `code` field for API-level errors (e.g. 301 = login
-// required).
+// check the response `code` field for non-retryable API-level errors (e.g.
+// 301 = login required).
 func apiGet(path string, target any) error {
-	endpoint := randomAPIEndpoint()
-	if endpoint == "" {
+	endpoints := shuffledAPIEndpoints()
+	if len(endpoints) == 0 {
 		pdk.Log(pdk.LogWarn, "api_endpoints not configured: set at least one API endpoint in the plugin settings")
 		return errNoAPIEndpoint
 	}
-	reqURL := endpoint + path
-	logURL := reqURL
+
+	cookieParam := ""
 	if musicU := getMusicU(); musicU != "" {
 		sep := "?"
 		if strings.Contains(path, "?") {
 			sep = "&"
 		}
-		reqURL += sep + "cookie=" + url.QueryEscape("MUSIC_U="+musicU)
+		cookieParam = sep + "cookie=" + url.QueryEscape("MUSIC_U="+musicU)
 	}
 
-	pdk.Log(pdk.LogDebug, "fetching Netease API: "+logURL)
+	var lastErr error
+	for _, endpoint := range endpoints {
+		reqURL := endpoint + path + cookieParam
+		pdk.Log(pdk.LogDebug, "fetching Netease API: "+endpoint+path)
 
-	body, statusCode, err := httpGet(reqURL)
-	if err != nil {
-		return fmt.Errorf("request failed: %w", err)
+		body, statusCode, err := httpGet(reqURL)
+		switch {
+		case err != nil:
+			lastErr = fmt.Errorf("%s: request failed: %w", endpoint, err)
+		case statusCode != 200:
+			lastErr = fmt.Errorf("%s: returned status %d", endpoint, statusCode)
+		default:
+			var head struct {
+				Code int `json:"code"`
+			}
+			if jsonErr := json.Unmarshal(body, &head); jsonErr == nil && retryableAPICodes[head.Code] {
+				lastErr = fmt.Errorf("%s: rate limited (code %d)", endpoint, head.Code)
+				break
+			}
+			if jsonErr := json.Unmarshal(body, target); jsonErr != nil {
+				lastErr = fmt.Errorf("%s: failed to parse response: %w", endpoint, jsonErr)
+				break
+			}
+			return nil
+		}
+		pdk.Log(pdk.LogDebug, "endpoint attempt failed, trying next: "+lastErr.Error())
 	}
-	if statusCode != 200 {
-		return fmt.Errorf("returned status %d", statusCode)
-	}
-	if err := json.Unmarshal(body, target); err != nil {
-		return fmt.Errorf("failed to parse response: %w", err)
-	}
-	return nil
+	return fmt.Errorf("all endpoints failed: %w", lastErr)
 }
 
 // isEnabled checks if a capability is enabled. Defaults to true; "false" disables.

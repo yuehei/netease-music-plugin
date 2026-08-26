@@ -87,9 +87,17 @@ func resolveArtistID(artistName string) (int64, error) {
 		return 0, fmt.Errorf("Netease artist search: %w", err)
 	}
 
-	if searchResp.Code != 200 || len(searchResp.Result.Artists) == 0 {
-		// Note: API-level failures (e.g. rate limiting) are also negative-cached
-		// for 2h, deliberately throttling retries to protect the upstream API.
+	if searchResp.Code != 200 {
+		// API-level failure (e.g. login required, upstream error): NOT a
+		// genuine "not found". Rate-limit codes are already retried across
+		// mirrors inside apiGet, so reaching here means a non-retryable
+		// code. Return an error without negative-caching, so the next scan
+		// retries instead of treating the artist as missing.
+		return 0, fmt.Errorf("artist search for '%s' returned code %d", artistName, searchResp.Code)
+	}
+	if len(searchResp.Result.Artists) == 0 {
+		// Genuine "no result": negative-cache for 2h to throttle retries
+		// for obscure names.
 		pdk.Log(pdk.LogDebug, "no artist found for: "+artistName)
 		if err := kvSetWithTTL(cacheKey, cachedArtistID{ArtistID: 0}, negativeCacheTTLSeconds); err != nil {
 			pdk.Log(pdk.LogWarn, "failed to cache negative artist result: "+err.Error())

@@ -47,22 +47,25 @@ var _ = Describe("helpers", func() {
 		})
 	})
 
-	Describe("randomAPIEndpoint", func() {
-		It("returns empty string when nothing is configured", func() {
+	Describe("shuffledAPIEndpoints", func() {
+		It("returns empty when nothing is configured", func() {
 			host.ConfigMock.On("Get", configAPIEndpoints).Return("", false)
-			Expect(randomAPIEndpoint()).To(Equal(""))
+			Expect(shuffledAPIEndpoints()).To(BeEmpty())
 		})
 
 		It("returns the only endpoint when one is configured", func() {
 			host.ConfigMock.On("Get", configAPIEndpoints).Return("https://only.example.com", true)
-			Expect(randomAPIEndpoint()).To(Equal("https://only.example.com"))
+			Expect(shuffledAPIEndpoints()).To(Equal([]string{"https://only.example.com"}))
 		})
 
-		It("always picks one of the configured endpoints", func() {
-			host.ConfigMock.On("Get", configAPIEndpoints).Return("https://a.example.com\nhttps://b.example.com", true)
-			allowed := []string{"https://a.example.com", "https://b.example.com"}
+		It("returns every configured endpoint exactly once", func() {
+			host.ConfigMock.On("Get", configAPIEndpoints).Return("https://a.example.com\nhttps://b.example.com\nhttps://c.example.com", true)
 			for i := 0; i < 20; i++ {
-				Expect(allowed).To(ContainElement(randomAPIEndpoint()))
+				Expect(shuffledAPIEndpoints()).To(ConsistOf(
+					"https://a.example.com",
+					"https://b.example.com",
+					"https://c.example.com",
+				))
 			}
 		})
 	})
@@ -147,6 +150,66 @@ var _ = Describe("helpers", func() {
 
 			var out struct{}
 			Expect(apiGet("/test", &out)).To(HaveOccurred())
+		})
+
+		It("falls through to the next endpoint when one is down", func() {
+			host.ConfigMock.On("Get", configAPIEndpoints).Return("https://down.example.com\nhttps://ok.example.com", true)
+			host.ConfigMock.On("Get", configMusicU).Return("", false)
+			host.HTTPMock.On("Send", mock.MatchedBy(func(req host.HTTPRequest) bool {
+				return strings.HasPrefix(req.URL, "https://down.example.com")
+			})).Return(&host.HTTPResponse{StatusCode: 502, Body: []byte("bad gateway")}, nil)
+			host.HTTPMock.On("Send", mock.MatchedBy(func(req host.HTTPRequest) bool {
+				return strings.HasPrefix(req.URL, "https://ok.example.com")
+			})).Return(&host.HTTPResponse{StatusCode: 200, Body: []byte(`{"code":200,"value":"ok"}`)}, nil)
+
+			var out struct {
+				Code  int    `json:"code"`
+				Value string `json:"value"`
+			}
+			Expect(apiGet("/test", &out)).To(Succeed())
+			Expect(out.Value).To(Equal("ok"))
+		})
+
+		It("falls through to the next endpoint on rate-limit codes", func() {
+			host.ConfigMock.On("Get", configAPIEndpoints).Return("https://limited.example.com\nhttps://ok.example.com", true)
+			host.ConfigMock.On("Get", configMusicU).Return("", false)
+			host.HTTPMock.On("Send", mock.MatchedBy(func(req host.HTTPRequest) bool {
+				return strings.HasPrefix(req.URL, "https://limited.example.com")
+			})).Return(&host.HTTPResponse{StatusCode: 200, Body: []byte(`{"code":460}`)}, nil)
+			host.HTTPMock.On("Send", mock.MatchedBy(func(req host.HTTPRequest) bool {
+				return strings.HasPrefix(req.URL, "https://ok.example.com")
+			})).Return(&host.HTTPResponse{StatusCode: 200, Body: []byte(`{"code":200,"value":"ok"}`)}, nil)
+
+			var out struct {
+				Code  int    `json:"code"`
+				Value string `json:"value"`
+			}
+			Expect(apiGet("/test", &out)).To(Succeed())
+			Expect(out.Value).To(Equal("ok"))
+		})
+
+		It("returns error when every endpoint is rate-limited", func() {
+			host.ConfigMock.On("Get", configAPIEndpoints).Return("https://a.example.com\nhttps://b.example.com", true)
+			host.ConfigMock.On("Get", configMusicU).Return("", false)
+			host.HTTPMock.On("Send", mock.Anything).Return(&host.HTTPResponse{StatusCode: 200, Body: []byte(`{"code":462}`)}, nil)
+
+			var out struct{}
+			err := apiGet("/test", &out)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("rate limited"))
+		})
+
+		It("does not treat non-retryable API codes as endpoint failure", func() {
+			host.ConfigMock.On("Get", configAPIEndpoints).Return("https://api.example.com", true)
+			host.ConfigMock.On("Get", configMusicU).Return("", false)
+			host.HTTPMock.On("Send", mock.Anything).Return(&host.HTTPResponse{StatusCode: 200, Body: []byte(`{"code":301}`)}, nil)
+
+			var out struct {
+				Code int `json:"code"`
+			}
+			// 301 (login required) is surfaced to the caller, not retried.
+			Expect(apiGet("/test", &out)).To(Succeed())
+			Expect(out.Code).To(Equal(301))
 		})
 	})
 
