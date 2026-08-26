@@ -7,6 +7,7 @@ import (
 	"math/rand/v2"
 	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/navidrome/navidrome/plugins/pdk/go/host"
 	"github.com/navidrome/navidrome/plugins/pdk/go/metadata"
@@ -36,6 +37,19 @@ func getAPIEndpoints() []string {
 
 // errNoAPIEndpoint is returned by apiGet when no API endpoint is configured.
 var errNoAPIEndpoint = errors.New("api_endpoints not configured: set at least one API endpoint in the plugin settings")
+
+// resolveLocks holds one mutex per cache key so concurrent capability calls
+// for the same artist/album share a single upstream fetch: the loser waits on
+// the mutex and then finds the winner's result in the cache (double-checked
+// locking). Entries are never removed — the memory cost is one mutex per
+// resolved name, negligible even for large libraries.
+var resolveLocks sync.Map // string -> *sync.Mutex
+
+// lockForKey returns the mutex serializing resolutions for the given cache key.
+func lockForKey(key string) *sync.Mutex {
+	mu, _ := resolveLocks.LoadOrStore(key, &sync.Mutex{})
+	return mu.(*sync.Mutex)
+}
 
 // retryableAPICodes are Netease API-level codes worth retrying on another
 // mirror: rate limiting is enforced per source IP, so a mirror returning one

@@ -97,6 +97,27 @@ func findBestAlbumMatch(albumName string, results []neteaseAlbum) *neteaseAlbum 
 	return nil
 }
 
+// readCachedAlbumMatch returns the cached album match for cacheKey. The second
+// return value reports whether a usable entry exists: a zero entry means
+// "known to not exist" (negative cache), while a legacy entry lacking the
+// album ID is treated as a miss so it gets refreshed.
+func readCachedAlbumMatch(cacheKey string) (*cachedAlbumMatch, bool) {
+	var cached cachedAlbumMatch
+	if !kvGet(cacheKey, &cached) {
+		return nil, false
+	}
+	if cached.AlbumID == 0 && cached.ArtworkURL == "" {
+		pdk.Log(pdk.LogDebug, "album negative cache hit: "+cacheKey)
+		return nil, true
+	}
+	if cached.AlbumID != 0 {
+		pdk.Log(pdk.LogDebug, "album cache hit: "+cacheKey)
+		return &cached, true
+	}
+	pdk.Log(pdk.LogDebug, "album cache entry missing ID, refreshing: "+cacheKey)
+	return nil, false
+}
+
 func resolveAlbumMatch(albumName, artistName string) (*cachedAlbumMatch, error) {
 	normalizedAlbum := normalizeName(albumName)
 	normalizedArtist := normalizeName(artistName)
@@ -109,19 +130,16 @@ func resolveAlbumMatch(albumName, artistName string) (*cachedAlbumMatch, error) 
 
 	// Check cache
 	cacheKey := fmt.Sprintf("album:%s:%s", normalizedArtist, normalizedAlbum)
-	var cached cachedAlbumMatch
-	if kvGet(cacheKey, &cached) {
-		if cached.AlbumID == 0 && cached.ArtworkURL == "" {
-			pdk.Log(pdk.LogDebug, "album negative cache hit: "+cacheKey)
-			return nil, nil
-		}
-		// Legacy cache entries may lack the album ID; treat as a miss so it can
-		// be populated on re-fetch.
-		if cached.AlbumID != 0 {
-			pdk.Log(pdk.LogDebug, "album cache hit: "+cacheKey)
-			return &cached, nil
-		}
-		pdk.Log(pdk.LogDebug, "album cache entry missing ID, refreshing: "+cacheKey)
+	if match, ok := readCachedAlbumMatch(cacheKey); ok {
+		return match, nil
+	}
+
+	// Serialize concurrent resolutions for this album (see resolveArtistID).
+	mu := lockForKey(cacheKey)
+	mu.Lock()
+	defer mu.Unlock()
+	if match, ok := readCachedAlbumMatch(cacheKey); ok {
+		return match, nil
 	}
 
 	// Resolve artist ID first

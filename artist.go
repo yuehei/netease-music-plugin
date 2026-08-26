@@ -61,6 +61,22 @@ type cachedArtistPage struct {
 	ImageURL  string `json:"imageURL,omitempty"`
 }
 
+// readCachedArtistID returns the cached resolution for cacheKey. The second
+// return value reports whether any cache entry exists — including negative
+// entries (ArtistID == 0), which mean "known to not exist", not "missing".
+func readCachedArtistID(cacheKey string) (int64, bool) {
+	var cached cachedArtistID
+	if !kvGet(cacheKey, &cached) {
+		return 0, false
+	}
+	if cached.ArtistID == 0 {
+		pdk.Log(pdk.LogDebug, "artist ID negative cache hit: "+cacheKey)
+		return 0, true
+	}
+	pdk.Log(pdk.LogDebug, "artist ID cache hit: "+cacheKey)
+	return cached.ArtistID, true
+}
+
 func resolveArtistID(artistName string) (int64, error) {
 	normalized := normalizeName(artistName)
 	if normalized == "" {
@@ -69,14 +85,17 @@ func resolveArtistID(artistName string) (int64, error) {
 
 	// Check cache
 	cacheKey := "artist:" + normalized
-	var cached cachedArtistID
-	if kvGet(cacheKey, &cached) {
-		if cached.ArtistID == 0 {
-			pdk.Log(pdk.LogDebug, "artist ID negative cache hit: "+normalized)
-			return 0, nil
-		}
-		pdk.Log(pdk.LogDebug, "artist ID cache hit: "+normalized)
-		return cached.ArtistID, nil
+	if id, ok := readCachedArtistID(cacheKey); ok {
+		return id, nil
+	}
+
+	// Serialize concurrent resolutions for this artist: wait for any in-flight
+	// fetch, then re-check the cache before hitting the API ourselves.
+	mu := lockForKey(cacheKey)
+	mu.Lock()
+	defer mu.Unlock()
+	if id, ok := readCachedArtistID(cacheKey); ok {
+		return id, nil
 	}
 
 	// Search Netease API (type=100: artists)
@@ -151,12 +170,23 @@ func findBestArtistMatch(query string, results []neteaseArtist) *neteaseArtist {
 
 // fetchArtistPage returns the artist's biography and image, from cache when
 // available. An entry with both fields empty is a valid (negative) cache entry.
+// Concurrent calls for the same artist ID share one upstream fetch via the
+// per-key lock.
 func fetchArtistPage(artistID int64) (*cachedArtistPage, error) {
 	cacheKey := fmt.Sprintf("page:%d", artistID)
 
 	var cached cachedArtistPage
 	if kvGet(cacheKey, &cached) {
 		pdk.Log(pdk.LogDebug, "page cache hit: "+cacheKey)
+		return &cached, nil
+	}
+
+	mu := lockForKey(cacheKey)
+	mu.Lock()
+	defer mu.Unlock()
+
+	if kvGet(cacheKey, &cached) {
+		pdk.Log(pdk.LogDebug, "page cache hit after wait: "+cacheKey)
 		return &cached, nil
 	}
 
