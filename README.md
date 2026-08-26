@@ -21,7 +21,7 @@ It provides artist biographies, images, similar artists, top songs, album artwor
 
 ## Installation
 
-1. Build or download the `netease-music.ndp` file
+1. 从 [Releases 页面](https://github.com/yuehei/netease-music-plugin/releases/)下载最新的 `netease-music.ndp`（或自行构建）
 2. Copy it to your Navidrome plugins folder. Default location: `<navidrome-data-directory>/plugins/`
 3. Add `netease-music` to the `Agents` [configuration option](https://www.navidrome.org/docs/usage/configuration/options/#advanced-configuration). For example:
    ```toml
