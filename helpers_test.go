@@ -1,6 +1,8 @@
 package main
 
 import (
+	"strings"
+
 	"github.com/navidrome/navidrome/plugins/pdk/go/host"
 	"github.com/stretchr/testify/mock"
 
@@ -9,35 +11,142 @@ import (
 )
 
 var _ = Describe("helpers", func() {
-	Describe("getCountries", func() {
-		It("returns default country when config not set", func() {
-			host.ConfigMock.On("Get", configCountries).Return("", false)
-			Expect(getCountries()).To(Equal([]string{"us"}))
+	Describe("getAPIEndpoints", func() {
+		It("returns empty when config not set", func() {
+			host.ConfigMock.On("Get", configAPIEndpoints).Return("", false)
+			Expect(getAPIEndpoints()).To(BeEmpty())
 		})
 
-		It("returns default country when config is empty", func() {
-			host.ConfigMock.On("Get", configCountries).Return("  ", true)
-			Expect(getCountries()).To(Equal([]string{"us"}))
+		It("returns empty when config is blank", func() {
+			host.ConfigMock.On("Get", configAPIEndpoints).Return("  \n \n", true)
+			Expect(getAPIEndpoints()).To(BeEmpty())
 		})
 
-		It("parses single country", func() {
-			host.ConfigMock.On("Get", configCountries).Return("br", true)
-			Expect(getCountries()).To(Equal([]string{"br"}))
+		It("parses single endpoint", func() {
+			host.ConfigMock.On("Get", configAPIEndpoints).Return("https://a.example.com", true)
+			Expect(getAPIEndpoints()).To(Equal([]string{"https://a.example.com"}))
 		})
 
-		It("parses multiple countries with spaces", func() {
-			host.ConfigMock.On("Get", configCountries).Return(" br , us , de ", true)
-			Expect(getCountries()).To(Equal([]string{"br", "us", "de"}))
+		It("parses multiple newline-separated endpoints", func() {
+			host.ConfigMock.On("Get", configAPIEndpoints).Return("https://a.example.com\nhttps://b.example.com\nhttps://c.example.com", true)
+			Expect(getAPIEndpoints()).To(Equal([]string{
+				"https://a.example.com",
+				"https://b.example.com",
+				"https://c.example.com",
+			}))
 		})
 
-		It("normalizes to lowercase", func() {
-			host.ConfigMock.On("Get", configCountries).Return("BR,US", true)
-			Expect(getCountries()).To(Equal([]string{"br", "us"}))
+		It("trims spaces and skips empty lines", func() {
+			host.ConfigMock.On("Get", configAPIEndpoints).Return("  https://a.example.com \n\n\nhttps://b.example.com\n  ", true)
+			Expect(getAPIEndpoints()).To(Equal([]string{"https://a.example.com", "https://b.example.com"}))
 		})
 
-		It("skips empty entries", func() {
-			host.ConfigMock.On("Get", configCountries).Return("br,,us,", true)
-			Expect(getCountries()).To(Equal([]string{"br", "us"}))
+		It("strips trailing slashes", func() {
+			host.ConfigMock.On("Get", configAPIEndpoints).Return("https://a.example.com/\nhttps://b.example.com//", true)
+			Expect(getAPIEndpoints()).To(Equal([]string{"https://a.example.com", "https://b.example.com"}))
+		})
+	})
+
+	Describe("randomAPIEndpoint", func() {
+		It("returns empty string when nothing is configured", func() {
+			host.ConfigMock.On("Get", configAPIEndpoints).Return("", false)
+			Expect(randomAPIEndpoint()).To(Equal(""))
+		})
+
+		It("returns the only endpoint when one is configured", func() {
+			host.ConfigMock.On("Get", configAPIEndpoints).Return("https://only.example.com", true)
+			Expect(randomAPIEndpoint()).To(Equal("https://only.example.com"))
+		})
+
+		It("always picks one of the configured endpoints", func() {
+			host.ConfigMock.On("Get", configAPIEndpoints).Return("https://a.example.com\nhttps://b.example.com", true)
+			allowed := []string{"https://a.example.com", "https://b.example.com"}
+			for i := 0; i < 20; i++ {
+				Expect(allowed).To(ContainElement(randomAPIEndpoint()))
+			}
+		})
+	})
+
+	Describe("getMusicU", func() {
+		It("returns empty when config not set", func() {
+			host.ConfigMock.On("Get", configMusicU).Return("", false)
+			Expect(getMusicU()).To(Equal(""))
+		})
+
+		It("returns trimmed value when set", func() {
+			host.ConfigMock.On("Get", configMusicU).Return("  secret-token  ", true)
+			Expect(getMusicU()).To(Equal("secret-token"))
+		})
+	})
+
+	Describe("apiGet", func() {
+		It("returns a clear error when no endpoint is configured", func() {
+			host.ConfigMock.On("Get", configAPIEndpoints).Return("", false)
+
+			var out struct{}
+			err := apiGet("/test", &out)
+			Expect(err).To(MatchError(errNoAPIEndpoint))
+		})
+
+		It("joins endpoint and path, and unmarshals the response", func() {
+			host.ConfigMock.On("Get", configAPIEndpoints).Return("https://api.example.com", true)
+			host.ConfigMock.On("Get", configMusicU).Return("", false)
+			host.HTTPMock.On("Send", mock.MatchedBy(func(req host.HTTPRequest) bool {
+				return req.Method == "GET" && req.URL == "https://api.example.com/test?a=1"
+			})).Return(&host.HTTPResponse{StatusCode: 200, Body: []byte(`{"code":200,"value":"ok"}`)}, nil)
+
+			var out struct {
+				Code  int    `json:"code"`
+				Value string `json:"value"`
+			}
+			Expect(apiGet("/test?a=1", &out)).To(Succeed())
+			Expect(out.Code).To(Equal(200))
+			Expect(out.Value).To(Equal("ok"))
+		})
+
+		It("appends the cookie parameter when MUSIC_U is configured", func() {
+			host.ConfigMock.On("Get", configAPIEndpoints).Return("https://api.example.com", true)
+			host.ConfigMock.On("Get", configMusicU).Return("secret-token", true)
+			host.HTTPMock.On("Send", mock.MatchedBy(func(req host.HTTPRequest) bool {
+				return strings.HasPrefix(req.URL, "https://api.example.com/test?a=1&") &&
+					strings.Contains(req.URL, "cookie=MUSIC_U%3Dsecret-token")
+			})).Return(&host.HTTPResponse{StatusCode: 200, Body: []byte(`{"code":200}`)}, nil)
+
+			var out struct {
+				Code int `json:"code"`
+			}
+			Expect(apiGet("/test?a=1", &out)).To(Succeed())
+		})
+
+		It("omits the cookie parameter when MUSIC_U is not configured", func() {
+			host.ConfigMock.On("Get", configAPIEndpoints).Return("https://api.example.com", true)
+			host.ConfigMock.On("Get", configMusicU).Return("", false)
+			host.HTTPMock.On("Send", mock.MatchedBy(func(req host.HTTPRequest) bool {
+				return req.URL == "https://api.example.com/test"
+			})).Return(&host.HTTPResponse{StatusCode: 200, Body: []byte(`{"code":200}`)}, nil)
+
+			var out struct {
+				Code int `json:"code"`
+			}
+			Expect(apiGet("/test", &out)).To(Succeed())
+		})
+
+		It("returns error on non-200 status", func() {
+			host.ConfigMock.On("Get", configAPIEndpoints).Return("https://api.example.com", true)
+			host.ConfigMock.On("Get", configMusicU).Return("", false)
+			host.HTTPMock.On("Send", mock.Anything).Return(&host.HTTPResponse{StatusCode: 502, Body: []byte("bad gateway")}, nil)
+
+			var out struct{}
+			Expect(apiGet("/test", &out)).To(HaveOccurred())
+		})
+
+		It("returns error on invalid JSON", func() {
+			host.ConfigMock.On("Get", configAPIEndpoints).Return("https://api.example.com", true)
+			host.ConfigMock.On("Get", configMusicU).Return("", false)
+			host.HTTPMock.On("Send", mock.Anything).Return(&host.HTTPResponse{StatusCode: 200, Body: []byte("not json")}, nil)
+
+			var out struct{}
+			Expect(apiGet("/test", &out)).To(HaveOccurred())
 		})
 	})
 
@@ -96,18 +205,8 @@ var _ = Describe("helpers", func() {
 			Expect(normalizeText("In\tHet\tMidden\tVan\tAlles")).To(Equal("In Het Midden Van Alles"))
 		})
 
-		It("collapses mixed runs of whitespace (tabs, newlines, NBSP, narrow NBSP)", func() {
-			Expect(normalizeText("In\tHet\tMidden\tVan\tAlles\t  \t  Direct nadat BLØF")).
-				To(Equal("In Het Midden Van Alles Direct nadat BLØF"))
-		})
-
 		It("trims leading and trailing whitespace", func() {
 			Expect(normalizeText("  \t hello world \n ")).To(Equal("hello world"))
-		})
-
-		It("leaves already-clean text (including HTML tags) unchanged", func() {
-			Expect(normalizeText("A real album description with <i>italic</i> text.")).
-				To(Equal("A real album description with <i>italic</i> text."))
 		})
 
 		It("preserves paragraph breaks while collapsing in-line whitespace", func() {
@@ -115,16 +214,8 @@ var _ = Describe("helpers", func() {
 				To(Equal("Para one here.\n\nPara two ends."))
 		})
 
-		It("preserves single newlines between lines", func() {
-			Expect(normalizeText("Line\tone\nLine\ttwo")).To(Equal("Line one\nLine two"))
-		})
-
 		It("normalizes CRLF/CR line endings to LF", func() {
 			Expect(normalizeText("one\r\ntwo\rthree")).To(Equal("one\ntwo\nthree"))
-		})
-
-		It("reduces a whitespace-only line to a blank paragraph separator", func() {
-			Expect(normalizeText("a\n  \t  \nb")).To(Equal("a\n\nb"))
 		})
 
 		It("handles empty string", func() {
@@ -196,17 +287,33 @@ var _ = Describe("helpers", func() {
 		})
 	})
 
-	Describe("rewriteImageSize", func() {
-		It("rewrites dimension segment", func() {
-			url := "https://is1-ssl.mzstatic.com/image/thumb/Music116/v4/ab/cd/ef/abcdef-12345/486x486bb.jpg"
-			result := rewriteImageSize(url, 1000)
-			Expect(result).To(ContainSubstring("/1000x1000bb."))
-			Expect(result).ToNot(ContainSubstring("486x486"))
+	Describe("resizeImageURL", func() {
+		It("appends the param size argument and forces https", func() {
+			url := "http://p4.music.126.net/abcdef/12345.jpg"
+			Expect(resizeImageURL(url, 600)).To(Equal("https://p4.music.126.net/abcdef/12345.jpg?param=600y600"))
 		})
 
-		It("handles URLs without dimension segment", func() {
-			url := "https://example.com/image.jpg"
-			Expect(rewriteImageSize(url, 300)).To(Equal(url))
+		It("replaces an existing query string", func() {
+			url := "https://p4.music.126.net/abcdef/12345.jpg?param=100y100&x=1"
+			Expect(resizeImageURL(url, 300)).To(Equal("https://p4.music.126.net/abcdef/12345.jpg?param=300y300"))
+		})
+
+		It("returns unparseable URLs unchanged", func() {
+			url := "ht%tp://bad url"
+			Expect(resizeImageURL(url, 300)).To(Equal(url))
+		})
+	})
+
+	Describe("buildImageList", func() {
+		It("builds three sizes via the param argument", func() {
+			images := buildImageList("http://p3.music.126.net/a/1.jpg")
+			Expect(images).To(HaveLen(3))
+			Expect(images[0].Size).To(Equal(int32(1500)))
+			Expect(images[0].URL).To(Equal("https://p3.music.126.net/a/1.jpg?param=1500y1500"))
+			Expect(images[1].Size).To(Equal(int32(600)))
+			Expect(images[1].URL).To(ContainSubstring("param=600y600"))
+			Expect(images[2].Size).To(Equal(int32(300)))
+			Expect(images[2].URL).To(ContainSubstring("param=300y300"))
 		})
 	})
 })

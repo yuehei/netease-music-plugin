@@ -1,5 +1,5 @@
 *.wasm
 *.ndp
 tmp
-apple-music
-apple-music-plugin
+netease-music
+netease-music-plugin

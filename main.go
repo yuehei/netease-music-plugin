@@ -12,8 +12,8 @@ import (
 //go:embed manifest.json
 var manifestJSON []byte
 
-// userAgent identifies the plugin to Apple's endpoints.
-var userAgent = "NavidromeAppleMusicPlugin/" + pluginVersion()
+// userAgent identifies the plugin to the API endpoints.
+var userAgent = "NavidromeNeteaseMusicPlugin/" + pluginVersion()
 
 // pluginVersion reads the version from the embedded manifest, falling back to a
 // placeholder if the manifest is missing or malformed.
@@ -28,17 +28,16 @@ func pluginVersion() string {
 }
 
 const (
-	defaultCountry          = "us"
+	neteaseArtistURL        = "https://music.163.com/#/artist?id=%d"
+	neteaseAlbumURL         = "https://music.163.com/#/album?id=%d"
 	defaultCacheTTL         = 7 // days
 	defaultTopSongs         = 10
 	httpTimeoutMs           = 10000
 	negativeCacheTTLSeconds = 7200 // 2 hours
-	iTunesSearchURL         = "https://itunes.apple.com/search"
-	iTunesLookupURL         = "https://itunes.apple.com/lookup"
-	appleMusicBaseURL       = "https://music.apple.com"
 
 	// Config keys
-	configCountries       = "countries"
+	configAPIEndpoints    = "api_endpoints"
+	configMusicU          = "music_u"
 	configCacheTTLDays    = "cache_ttl_days"
 	configArtistURL       = "enable_artist_url"
 	configArtistBiography = "enable_artist_biography"
@@ -51,25 +50,25 @@ const (
 
 // Compile-time interface assertions
 var (
-	_ metadata.ArtistURLProvider       = (*appleMusicAgent)(nil)
-	_ metadata.ArtistBiographyProvider = (*appleMusicAgent)(nil)
-	_ metadata.ArtistImagesProvider    = (*appleMusicAgent)(nil)
-	_ metadata.SimilarArtistsProvider  = (*appleMusicAgent)(nil)
-	_ metadata.ArtistTopSongsProvider  = (*appleMusicAgent)(nil)
-	_ metadata.AlbumImagesProvider     = (*appleMusicAgent)(nil)
-	_ metadata.AlbumInfoProvider       = (*appleMusicAgent)(nil)
+	_ metadata.ArtistURLProvider       = (*neteaseMusicAgent)(nil)
+	_ metadata.ArtistBiographyProvider = (*neteaseMusicAgent)(nil)
+	_ metadata.ArtistImagesProvider    = (*neteaseMusicAgent)(nil)
+	_ metadata.SimilarArtistsProvider  = (*neteaseMusicAgent)(nil)
+	_ metadata.ArtistTopSongsProvider  = (*neteaseMusicAgent)(nil)
+	_ metadata.AlbumImagesProvider     = (*neteaseMusicAgent)(nil)
+	_ metadata.AlbumInfoProvider       = (*neteaseMusicAgent)(nil)
 )
 
 func init() {
-	metadata.Register(&appleMusicAgent{})
+	metadata.Register(&neteaseMusicAgent{})
 }
 
 func main() {}
 
-type appleMusicAgent struct{}
+type neteaseMusicAgent struct{}
 
-// GetArtistURL returns the Apple Music URL for the artist.
-func (a *appleMusicAgent) GetArtistURL(input metadata.ArtistRequest) (*metadata.ArtistURLResponse, error) {
+// GetArtistURL returns the Netease Cloud Music URL for the artist.
+func (a *neteaseMusicAgent) GetArtistURL(input metadata.ArtistRequest) (*metadata.ArtistURLResponse, error) {
 	if !isEnabled(configArtistURL) {
 		return nil, nil
 	}
@@ -81,13 +80,11 @@ func (a *appleMusicAgent) GetArtistURL(input metadata.ArtistRequest) (*metadata.
 		return nil, nil
 	}
 
-	countries := getCountries()
-	artistURL := fmt.Sprintf("%s/%s/artist/-/%d", appleMusicBaseURL, countries[0], artistID)
-	return &metadata.ArtistURLResponse{URL: artistURL}, nil
+	return &metadata.ArtistURLResponse{URL: fmt.Sprintf(neteaseArtistURL, artistID)}, nil
 }
 
-// GetArtistBiography returns the artist biography from Apple Music.
-func (a *appleMusicAgent) GetArtistBiography(input metadata.ArtistRequest) (*metadata.ArtistBiographyResponse, error) {
+// GetArtistBiography returns the artist biography from Netease Cloud Music.
+func (a *neteaseMusicAgent) GetArtistBiography(input metadata.ArtistRequest) (*metadata.ArtistBiographyResponse, error) {
 	if !isEnabled(configArtistBiography) {
 		return nil, nil
 	}
@@ -99,11 +96,11 @@ func (a *appleMusicAgent) GetArtistBiography(input metadata.ArtistRequest) (*met
 		return nil, nil
 	}
 
-	page, err := fetchArtistPage(artistID, fieldBiography)
+	page, err := fetchArtistPage(artistID)
 	if err != nil {
 		return nil, err
 	}
-	if page == nil || page.Biography == "" || isPlaceholderBiography(page.Biography) {
+	if page == nil || page.Biography == "" {
 		pdk.Log(pdk.LogDebug, "no biography found for: "+input.Name)
 		return nil, nil
 	}
@@ -111,8 +108,8 @@ func (a *appleMusicAgent) GetArtistBiography(input metadata.ArtistRequest) (*met
 	return &metadata.ArtistBiographyResponse{Biography: page.Biography}, nil
 }
 
-// GetArtistImages returns artist images from Apple Music in multiple sizes.
-func (a *appleMusicAgent) GetArtistImages(input metadata.ArtistRequest) (*metadata.ArtistImagesResponse, error) {
+// GetArtistImages returns artist images from Netease Cloud Music in multiple sizes.
+func (a *neteaseMusicAgent) GetArtistImages(input metadata.ArtistRequest) (*metadata.ArtistImagesResponse, error) {
 	if !isEnabled(configArtistImages) {
 		return nil, nil
 	}
@@ -124,11 +121,11 @@ func (a *appleMusicAgent) GetArtistImages(input metadata.ArtistRequest) (*metada
 		return nil, nil
 	}
 
-	page, err := fetchArtistPage(artistID, fieldImage)
+	page, err := fetchArtistPage(artistID)
 	if err != nil {
 		return nil, err
 	}
-	if page == nil || page.ImageURL == "" || isPlaceholderImage(page.ImageURL) {
+	if page == nil || page.ImageURL == "" {
 		pdk.Log(pdk.LogDebug, "no artist image found for: "+input.Name)
 		return nil, nil
 	}
@@ -136,8 +133,9 @@ func (a *appleMusicAgent) GetArtistImages(input metadata.ArtistRequest) (*metada
 	return &metadata.ArtistImagesResponse{Images: buildImageList(page.ImageURL)}, nil
 }
 
-// GetSimilarArtists returns similar artists scraped from the Apple Music page.
-func (a *appleMusicAgent) GetSimilarArtists(input metadata.SimilarArtistsRequest) (*metadata.SimilarArtistsResponse, error) {
+// GetSimilarArtists returns similar artists from Netease Cloud Music.
+// Requires the MUSIC_U cookie to be configured; degrades gracefully otherwise.
+func (a *neteaseMusicAgent) GetSimilarArtists(input metadata.SimilarArtistsRequest) (*metadata.SimilarArtistsResponse, error) {
 	if !isEnabled(configSimilarArtists) {
 		return nil, nil
 	}
@@ -149,29 +147,29 @@ func (a *appleMusicAgent) GetSimilarArtists(input metadata.SimilarArtistsRequest
 		return nil, nil
 	}
 
-	page, err := fetchArtistPage(artistID, fieldSimilar)
+	similar, err := fetchSimilarArtists(artistID)
 	if err != nil {
 		return nil, err
 	}
-	if page == nil || len(page.SimilarArtists) == 0 {
+	if len(similar) == 0 {
 		pdk.Log(pdk.LogDebug, "no similar artists found for: "+input.Name)
 		return nil, nil
 	}
 
-	limit := clampLimit(int(input.Limit), len(page.SimilarArtists))
+	limit := clampLimit(int(input.Limit), len(similar))
 
 	artists := make([]metadata.ArtistRef, 0, limit)
 	for i := 0; i < limit; i++ {
 		artists = append(artists, metadata.ArtistRef{
-			Name: page.SimilarArtists[i].Name,
+			Name: similar[i].Name,
 		})
 	}
 
 	return &metadata.SimilarArtistsResponse{Artists: artists}, nil
 }
 
-// GetArtistTopSongs returns the artist's top songs via the iTunes Lookup API.
-func (a *appleMusicAgent) GetArtistTopSongs(input metadata.TopSongsRequest) (*metadata.TopSongsResponse, error) {
+// GetArtistTopSongs returns the artist's hot songs via the Netease API.
+func (a *neteaseMusicAgent) GetArtistTopSongs(input metadata.TopSongsRequest) (*metadata.TopSongsResponse, error) {
 	if !isEnabled(configTopSongs) {
 		return nil, nil
 	}
@@ -196,28 +194,10 @@ func (a *appleMusicAgent) GetArtistTopSongs(input metadata.TopSongsRequest) (*me
 		return &cached, nil
 	}
 
-	// Fetch from iTunes Lookup API
-	lookupURL := fmt.Sprintf("%s?id=%d&entity=song&sort=popular&limit=%d",
-		iTunesLookupURL, artistID, count)
-
-	pdk.Log(pdk.LogDebug, "fetching top songs: "+lookupURL)
-
-	var lookupResp itunesLookupResponse
-	if err := httpGetJSON(lookupURL, &lookupResp); err != nil {
-		return nil, fmt.Errorf("iTunes top songs lookup: %w", err)
+	songs, err := fetchTopSongs(artistID, count)
+	if err != nil {
+		return nil, err
 	}
-
-	// First result is the artist itself, skip it
-	songs := make([]metadata.SongRef, 0, len(lookupResp.Results))
-	for _, r := range lookupResp.Results {
-		if r.WrapperType == "track" && r.TrackName != "" {
-			songs = append(songs, metadata.SongRef{
-				Name:   r.TrackName,
-				Artist: r.ArtistName,
-			})
-		}
-	}
-
 	if len(songs) == 0 {
 		pdk.Log(pdk.LogDebug, "no top songs found for: "+input.Name)
 		return nil, nil
@@ -234,8 +214,8 @@ func (a *appleMusicAgent) GetArtistTopSongs(input metadata.TopSongsRequest) (*me
 	return result, nil
 }
 
-// GetAlbumImages returns album artwork from Apple Music in multiple sizes.
-func (a *appleMusicAgent) GetAlbumImages(input metadata.AlbumRequest) (*metadata.AlbumImagesResponse, error) {
+// GetAlbumImages returns album artwork from Netease Cloud Music in multiple sizes.
+func (a *neteaseMusicAgent) GetAlbumImages(input metadata.AlbumRequest) (*metadata.AlbumImagesResponse, error) {
 	if !isEnabled(configAlbumImages) {
 		return nil, nil
 	}
@@ -252,10 +232,10 @@ func (a *appleMusicAgent) GetAlbumImages(input metadata.AlbumRequest) (*metadata
 	return &metadata.AlbumImagesResponse{Images: buildImageList(match.ArtworkURL)}, nil
 }
 
-// GetAlbumInfo returns the Apple Music URL and editorial description for an album.
+// GetAlbumInfo returns the Netease Cloud Music URL and editorial description for an album.
 // Uses a dedicated album_info cache (separate from the album-match cache) so that
-// a cache hit avoids both the iTunes Lookup KV read and the album page fetch.
-func (a *appleMusicAgent) GetAlbumInfo(input metadata.AlbumRequest) (*metadata.AlbumInfoResponse, error) {
+// a cache hit avoids both the album match KV read and the album detail fetch.
+func (a *neteaseMusicAgent) GetAlbumInfo(input metadata.AlbumRequest) (*metadata.AlbumInfoResponse, error) {
 	if !isEnabled(configAlbumInfo) {
 		return nil, nil
 	}
@@ -277,23 +257,23 @@ func (a *appleMusicAgent) GetAlbumInfo(input metadata.AlbumRequest) (*metadata.A
 	if err != nil {
 		return nil, err
 	}
-	if match == nil || match.CollectionViewURL == "" {
+	if match == nil || match.AlbumID == 0 {
 		return nil, nil
 	}
 
 	resp := &metadata.AlbumInfoResponse{
 		Name: input.Name,
-		URL:  match.CollectionViewURL,
+		URL:  fmt.Sprintf(neteaseAlbumURL, match.AlbumID),
 	}
 
-	description, fetched := fetchAlbumDescription(match.CollectionViewURL)
+	description, fetched := fetchAlbumDescription(match.AlbumID)
 	resp.Description = description
 	if !fetched {
-		// All country fetches failed: return URL but don't cache, so the next call retries.
+		// Fetch failed: return URL but don't cache, so the next call retries.
 		return resp, nil
 	}
 
-	entry := cachedAlbumInfo{URL: match.CollectionViewURL, Description: description}
+	entry := cachedAlbumInfo{URL: resp.URL, Description: description}
 	if err := kvSetWithTTL(cacheKey, entry, getCacheTTLSeconds()); err != nil {
 		pdk.Log(pdk.LogWarn, "failed to cache album info: "+err.Error())
 	}

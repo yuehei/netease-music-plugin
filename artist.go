@@ -1,69 +1,65 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
-	"regexp"
 	"strings"
 
+	"github.com/navidrome/navidrome/plugins/pdk/go/metadata"
 	"github.com/navidrome/navidrome/plugins/pdk/go/pdk"
 )
 
-type itunesSearchResponse struct {
-	ResultCount int                  `json:"resultCount"`
-	Results     []itunesArtistResult `json:"results"`
+type neteaseArtist struct {
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
 }
 
-type itunesArtistResult struct {
-	WrapperType string `json:"wrapperType"`
-	ArtistName  string `json:"artistName"`
-	ArtistID    int64  `json:"artistId"`
+type neteaseArtistSearchResponse struct {
+	Code   int `json:"code"`
+	Result struct {
+		Artists []neteaseArtist `json:"artists"`
+	} `json:"result"`
 }
 
-type itunesLookupResponse struct {
-	ResultCount int                  `json:"resultCount"`
-	Results     []itunesLookupResult `json:"results"`
+type neteaseArtistDetailResponse struct {
+	Code int `json:"code"`
+	Data struct {
+		Artist struct {
+			ID        int64  `json:"id"`
+			Name      string `json:"name"`
+			Cover     string `json:"cover"`
+			Avatar    string `json:"avatar"`
+			BriefDesc string `json:"briefDesc"`
+		} `json:"artist"`
+	} `json:"data"`
 }
 
-type itunesLookupResult struct {
-	WrapperType string `json:"wrapperType"`
-	ArtistName  string `json:"artistName"`
-	TrackName   string `json:"trackName"`
-	ArtistID    int64  `json:"artistId"`
+type neteaseTopSongResponse struct {
+	Code  int `json:"code"`
+	Songs []struct {
+		Name    string `json:"name"`
+		Artists []struct {
+			Name string `json:"name"`
+		} `json:"ar"`
+	} `json:"songs"`
+}
+
+type neteaseSimiArtistResponse struct {
+	Code    int             `json:"code"`
+	Artists []neteaseArtist `json:"artists"`
 }
 
 type cachedArtistID struct {
 	ArtistID int64 `json:"artistId"`
 }
 
-type parsedPageData struct {
-	Biography      string              `json:"biography,omitempty"`
-	ImageURL       string              `json:"imageURL,omitempty"`
-	SimilarArtists []similarArtistInfo `json:"similarArtists,omitempty"`
+// cachedArtistPage stores the artist detail fields shared by the biography
+// and images capabilities, so one fetch serves both.
+type cachedArtistPage struct {
+	Biography string `json:"biography,omitempty"`
+	ImageURL  string `json:"imageURL,omitempty"`
 }
-
-type similarArtistInfo struct {
-	Name string `json:"name"`
-}
-
-type jsonLDData struct {
-	Context     string `json:"@context"`
-	Type        string `json:"@type"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Image       string `json:"image"`
-}
-
-type pageField int
-
-const (
-	fieldAny       pageField = iota // any non-empty field
-	fieldBiography                  // Biography
-	fieldImage                      // ImageURL
-	fieldSimilar                    // SimilarArtists
-)
 
 func resolveArtistID(artistName string) (int64, error) {
 	normalized := normalizeName(artistName)
@@ -83,311 +79,171 @@ func resolveArtistID(artistName string) (int64, error) {
 		return cached.ArtistID, nil
 	}
 
-	// Search iTunes API
-	countries := getCountries()
-	country := countries[0]
+	// Search Netease API (type=100: artists)
+	path := fmt.Sprintf("/search?keywords=%s&type=100&limit=5", url.QueryEscape(artistName))
 
-	searchURL := fmt.Sprintf("%s?term=%s&entity=musicArtist&limit=5&country=%s",
-		iTunesSearchURL, url.QueryEscape(artistName), url.QueryEscape(country))
-
-	pdk.Log(pdk.LogDebug, "searching iTunes API: "+searchURL)
-
-	var searchResp itunesSearchResponse
-	if err := httpGetJSON(searchURL, &searchResp); err != nil {
-		return 0, fmt.Errorf("iTunes artist search: %w", err)
+	var searchResp neteaseArtistSearchResponse
+	if err := apiGet(path, &searchResp); err != nil {
+		return 0, fmt.Errorf("Netease artist search: %w", err)
 	}
 
-	if searchResp.ResultCount == 0 {
+	if searchResp.Code != 200 || len(searchResp.Result.Artists) == 0 {
+		// Note: API-level failures (e.g. rate limiting) are also negative-cached
+		// for 2h, deliberately throttling retries to protect the upstream API.
 		pdk.Log(pdk.LogDebug, "no artist found for: "+artistName)
 		if err := kvSetWithTTL(cacheKey, cachedArtistID{ArtistID: 0}, negativeCacheTTLSeconds); err != nil {
 			pdk.Log(pdk.LogWarn, "failed to cache negative artist result: "+err.Error())
+		} else {
+			pdk.Log(pdk.LogDebug, "cached negative artist ID: "+cacheKey)
 		}
 		return 0, nil
 	}
 
 	// Find best match by name similarity
-	bestMatch := findBestArtistMatch(artistName, searchResp.Results)
+	bestMatch := findBestArtistMatch(artistName, searchResp.Result.Artists)
 	if bestMatch == nil {
 		pdk.Log(pdk.LogDebug, "no matching artist found for: "+artistName)
 		if err := kvSetWithTTL(cacheKey, cachedArtistID{ArtistID: 0}, negativeCacheTTLSeconds); err != nil {
 			pdk.Log(pdk.LogWarn, "failed to cache negative artist result: "+err.Error())
+		} else {
+			pdk.Log(pdk.LogDebug, "cached negative artist ID: "+cacheKey)
 		}
 		return 0, nil
 	}
 
-	// Cache permanently
-	if err := kvSet(cacheKey, cachedArtistID{ArtistID: bestMatch.ArtistID}); err != nil {
-		pdk.Log(pdk.LogWarn, "failed to cache artist ID: "+err.Error())
+	if normalizeName(bestMatch.Name) != normalized {
+		pdk.Log(pdk.LogInfo, fmt.Sprintf("no exact match for '%s', using best candidate '%s' (ID %d)", artistName, bestMatch.Name, bestMatch.ID))
 	}
 
-	pdk.Log(pdk.LogInfo, fmt.Sprintf("resolved artist '%s' → ID %d", artistName, bestMatch.ArtistID))
-	return bestMatch.ArtistID, nil
+	// Cache permanently
+	if err := kvSet(cacheKey, cachedArtistID{ArtistID: bestMatch.ID}); err != nil {
+		pdk.Log(pdk.LogWarn, "failed to cache artist ID: "+err.Error())
+	} else {
+		pdk.Log(pdk.LogDebug, fmt.Sprintf("cached artist ID: %s → %d", cacheKey, bestMatch.ID))
+	}
+
+	pdk.Log(pdk.LogInfo, fmt.Sprintf("resolved artist '%s' → ID %d", artistName, bestMatch.ID))
+	return bestMatch.ID, nil
 }
 
-func findBestArtistMatch(query string, results []itunesArtistResult) *itunesArtistResult {
+// findBestArtistMatch returns the exact name match, or the first result when
+// no exact match exists (Netease ranks results by relevance).
+func findBestArtistMatch(query string, results []neteaseArtist) *neteaseArtist {
 	normalized := normalizeName(query)
-	var firstArtist *itunesArtistResult
 	for i := range results {
-		if results[i].WrapperType != "artist" {
-			continue
-		}
-		if firstArtist == nil {
-			firstArtist = &results[i]
-		}
-		if normalizeName(results[i].ArtistName) == normalized {
+		if normalizeName(results[i].Name) == normalized {
 			return &results[i]
 		}
 	}
-	return firstArtist
+	if len(results) > 0 {
+		return &results[0]
+	}
+	return nil
 }
 
-var jsonLDRegex = regexp.MustCompile(`(?i)<script[^>]*type="application/ld\+json"[^>]*>`)
+// fetchArtistPage returns the artist's biography and image, from cache when
+// available. An entry with both fields empty is a valid (negative) cache entry.
+func fetchArtistPage(artistID int64) (*cachedArtistPage, error) {
+	cacheKey := fmt.Sprintf("page:%d", artistID)
 
-func parseJSONLD(html string) (*jsonLDData, error) {
-	const endTag = `</script>`
-
-	loc := jsonLDRegex.FindStringIndex(html)
-	if loc == nil {
-		return nil, errors.New("no JSON-LD found")
-	}
-	startIdx := loc[1] // position right after the opening tag
-
-	endIdx := strings.Index(html[startIdx:], endTag)
-	if endIdx == -1 {
-		return nil, errors.New("malformed JSON-LD")
+	var cached cachedArtistPage
+	if kvGet(cacheKey, &cached) {
+		pdk.Log(pdk.LogDebug, "page cache hit: "+cacheKey)
+		return &cached, nil
 	}
 
-	jsonStr := strings.TrimSpace(html[startIdx : startIdx+endIdx])
+	path := fmt.Sprintf("/artist/detail?id=%d", artistID)
 
-	var ld jsonLDData
-	if err := json.Unmarshal([]byte(jsonStr), &ld); err != nil {
-		return nil, fmt.Errorf("failed to parse JSON-LD: %w", err)
+	var detailResp neteaseArtistDetailResponse
+	if err := apiGet(path, &detailResp); err != nil {
+		return nil, fmt.Errorf("Netease artist detail: %w", err)
+	}
+	if detailResp.Code != 200 {
+		pdk.Log(pdk.LogDebug, fmt.Sprintf("artist detail returned code %d for artist %d", detailResp.Code, artistID))
+		return nil, nil
 	}
 
-	return &ld, nil
+	artist := detailResp.Data.Artist
+	page := &cachedArtistPage{
+		Biography: normalizeText(artist.BriefDesc),
+		ImageURL:  artist.Avatar,
+	}
+	if page.ImageURL == "" {
+		page.ImageURL = artist.Cover
+	}
+
+	if err := kvSetWithTTL(cacheKey, page, getCacheTTLSeconds()); err != nil {
+		pdk.Log(pdk.LogWarn, "failed to cache page data: "+err.Error())
+	}
+
+	return page, nil
 }
 
-const placeholderImageURL = "https://music.apple.com/assets/meta/apple-music.png"
+// fetchSimilarArtists calls /simi/artist, which requires a logged-in cookie.
+// When the API reports "login required" (or any non-200 code), it degrades
+// gracefully and returns an empty list.
+func fetchSimilarArtists(artistID int64) ([]neteaseArtist, error) {
+	cacheKey := fmt.Sprintf("simi:%d", artistID)
 
-func isPlaceholderImage(url string) bool {
-	return url == placeholderImageURL
-}
-
-// appleMusicRegex matches "Apple Music" with any whitespace between the words,
-// including non-breaking spaces (U+00A0) used in some locales.
-var appleMusicRegex = regexp.MustCompile(`Apple[\s\pZ]+Music`)
-
-// isPlaceholderBiography returns true if the text is a generic Apple Music promotional
-// description rather than a real artist biography. Apple Music returns these for artists
-// without a curated bio. The placeholder always mentions "Apple Music" in its first
-// sentence (e.g., "Listen to music by X on Apple Music."). Real biographies may mention
-// "Apple Music" deeper in the text (e.g., awards), so we only check the first sentence.
-func isPlaceholderBiography(text string) bool {
-	firstSentence := text
-	if idx := strings.Index(text, ". "); idx != -1 {
-		firstSentence = text[:idx]
+	var cached []neteaseArtist
+	if kvGet(cacheKey, &cached) {
+		pdk.Log(pdk.LogDebug, "similar artists cache hit: "+cacheKey)
+		return cached, nil
 	}
-	return appleMusicRegex.MatchString(firstSentence)
-}
 
-func parseOpenGraphImage(html string) string {
-	// Look for <meta property="og:image" content="...">
-	pattern := `<meta property="og:image" content="`
-	idx := strings.Index(html, pattern)
-	if idx == -1 {
-		return ""
+	path := fmt.Sprintf("/simi/artist?id=%d", artistID)
+
+	var simiResp neteaseSimiArtistResponse
+	if err := apiGet(path, &simiResp); err != nil {
+		return nil, fmt.Errorf("Netease similar artists: %w", err)
 	}
-	idx += len(pattern)
-	endIdx := strings.Index(html[idx:], `"`)
-	if endIdx == -1 {
-		return ""
+	if simiResp.Code != 200 {
+		// 301 = login required: MUSIC_U not configured or expired.
+		pdk.Log(pdk.LogDebug, fmt.Sprintf("similar artists returned code %d for artist %d (login required?)", simiResp.Code, artistID))
+		return nil, nil
 	}
-	return html[idx : idx+endIdx]
+
+	artists := simiResp.Artists
+	if artists == nil {
+		artists = []neteaseArtist{}
+	}
+	if err := kvSetWithTTL(cacheKey, artists, getCacheTTLSeconds()); err != nil {
+		pdk.Log(pdk.LogWarn, "failed to cache similar artists: "+err.Error())
+	}
+
+	return artists, nil
 }
 
-const (
-	similarSectionMaxBytes = 60000 // generous chunk after section marker to cover all artist lockups
-	sectionBoundaryOffset  = 100   // skip initial chars before searching for next section boundary
-)
+// fetchTopSongs returns the artist's hot songs (up to ~50) from
+// /artist/top/song. Artist names of a track are joined with " / ".
+func fetchTopSongs(artistID int64, count int) ([]metadata.SongRef, error) {
+	path := fmt.Sprintf("/artist/top/song?id=%d", artistID)
 
-var similarSectionMarkers = []string{
-	`aria-label="Similar Artists"`,
-	`aria-label="Artistas semelhantes"`,
-	`aria-label="Ähnliche Künstler"`,
-	`aria-label="Artistes similaires"`,
-	`aria-label="Artistas similares"`,
-}
+	var topResp neteaseTopSongResponse
+	if err := apiGet(path, &topResp); err != nil {
+		return nil, fmt.Errorf("Netease top songs: %w", err)
+	}
+	if topResp.Code != 200 {
+		pdk.Log(pdk.LogDebug, fmt.Sprintf("top songs returned code %d for artist %d", topResp.Code, artistID))
+		return nil, nil
+	}
 
-var lockupTitleRegex = regexp.MustCompile(`data-testid="ellipse-lockup__title"[^>]*>([^<]+)<`)
-
-func parseSimilarArtists(html string) []similarArtistInfo {
-	// Find the similar artists section by looking for localized aria-label markers.
-	sectionStart := -1
-	for _, marker := range similarSectionMarkers {
-		idx := strings.Index(html, marker)
-		if idx != -1 {
-			pdk.Log(pdk.LogDebug, fmt.Sprintf("similar artists: found marker %q at position %d", marker, idx))
-			sectionStart = idx
+	songs := make([]metadata.SongRef, 0, min(count, len(topResp.Songs)))
+	for i, s := range topResp.Songs {
+		if i >= count {
 			break
 		}
-	}
-
-	if sectionStart == -1 {
-		pdk.Log(pdk.LogDebug, "similar artists: no section markers found in HTML")
-		return nil
-	}
-
-	// Extract a generous chunk after the section marker to cover all artist lockups.
-	sectionEnd := min(sectionStart+similarSectionMaxBytes, len(html))
-	section := html[sectionStart:sectionEnd]
-
-	// Limit to the current section by finding the next section boundary.
-	if nextSection := strings.Index(section[sectionBoundaryOffset:], `data-testid="section-container"`); nextSection != -1 {
-		section = section[:sectionBoundaryOffset+nextSection]
-	}
-	pdk.Log(pdk.LogDebug, fmt.Sprintf("similar artists: extracting from section (%d chars)", len(section)))
-
-	// Extract artist names from ellipse-lockup title elements.
-	var artists []similarArtistInfo
-	seen := make(map[string]bool)
-
-	matches := lockupTitleRegex.FindAllStringSubmatch(section, -1)
-	pdk.Log(pdk.LogDebug, fmt.Sprintf("similar artists: found %d lockup titles in section", len(matches)))
-	for _, m := range matches {
-		name := strings.TrimSpace(m[1])
-		if name == "" || seen[name] {
+		if s.Name == "" {
 			continue
 		}
-		seen[name] = true
-		artists = append(artists, similarArtistInfo{Name: name})
-		pdk.Log(pdk.LogDebug, fmt.Sprintf("similar artists: found artist %q", name))
-	}
-
-	pdk.Log(pdk.LogDebug, fmt.Sprintf("similar artists: total found=%d", len(artists)))
-	return artists
-}
-
-// fetchArtistPage tries each configured country in order until a page with the
-// requested field is found.
-func fetchArtistPage(artistID int64, wantField pageField) (*parsedPageData, error) {
-	countries := getCountries()
-	ttl := getCacheTTLSeconds()
-	var firstResult *parsedPageData
-
-	for _, country := range countries {
-		cacheKey := fmt.Sprintf("page:%d:%s", artistID, country)
-
-		// Check cache
-		var cached parsedPageData
-		if kvGet(cacheKey, &cached) {
-			pdk.Log(pdk.LogDebug, fmt.Sprintf("page cache hit: %s", cacheKey))
-			if firstResult == nil {
-				firstResult = &cached
-			}
-			if hasField(&cached, wantField) {
-				return &cached, nil
-			}
-			continue
+		names := make([]string, 0, len(s.Artists))
+		for _, a := range s.Artists {
+			names = append(names, a.Name)
 		}
-
-		// Fetch page
-		pageURL := fmt.Sprintf("%s/%s/artist/-/%d", appleMusicBaseURL, country, artistID)
-		pdk.Log(pdk.LogDebug, "fetching Apple Music page: "+pageURL)
-
-		body, statusCode, err := httpGet(pageURL)
-		if err != nil {
-			pdk.Log(pdk.LogWarn, fmt.Sprintf("failed to fetch page for country %s: %s", country, err.Error()))
-			continue
-		}
-		if statusCode != 200 {
-			pdk.Log(pdk.LogWarn, fmt.Sprintf("Apple Music page returned %d for country %s", statusCode, country))
-			continue
-		}
-
-		html := string(body)
-		pdk.Log(pdk.LogDebug, fmt.Sprintf("received page for country %s: %d bytes, status %d", country, len(body), statusCode))
-		page := parsePage(html)
-
-		// Cache the result
-		if err := kvSetWithTTL(cacheKey, page, ttl); err != nil {
-			pdk.Log(pdk.LogWarn, "failed to cache page data: "+err.Error())
-		}
-
-		if firstResult == nil {
-			firstResult = page
-		}
-		if hasField(page, wantField) {
-			return page, nil
-		}
+		songs = append(songs, metadata.SongRef{
+			Name:   s.Name,
+			Artist: strings.Join(names, " / "),
+		})
 	}
-
-	if firstResult != nil {
-		return firstResult, nil
-	}
-	pdk.Log(pdk.LogDebug, fmt.Sprintf("no page data found for artist %d in any country", artistID))
-	return nil, nil
-}
-
-// parsePage parses all fields so the cached result is complete for any future capability.
-func parsePage(html string) *parsedPageData {
-	page := &parsedPageData{}
-
-	pdk.Log(pdk.LogDebug, fmt.Sprintf("parsing page HTML (%d bytes)", len(html)))
-
-	// Parse JSON-LD for biography and image
-	ld, err := parseJSONLD(html)
-	if err == nil {
-		page.Biography = normalizeText(ld.Description)
-		page.ImageURL = ld.Image
-		pdk.Log(pdk.LogDebug, fmt.Sprintf("JSON-LD parsed: type=%s, name=%s, bio=%d chars, image=%s",
-			ld.Type, ld.Name, len(ld.Description), ld.Image))
-	} else {
-		pdk.Log(pdk.LogDebug, "JSON-LD parsing failed: "+err.Error())
-	}
-
-	// Discard generic Apple Music promotional description (not a real biography)
-	if isPlaceholderBiography(page.Biography) {
-		pdk.Log(pdk.LogDebug, "discarding placeholder biography: "+page.Biography)
-		page.Biography = ""
-	}
-
-	// Discard generic Apple Music placeholder image
-	if isPlaceholderImage(page.ImageURL) {
-		pdk.Log(pdk.LogDebug, "discarding placeholder image: "+page.ImageURL)
-		page.ImageURL = ""
-	}
-
-	// Fallback to OpenGraph for image
-	if page.ImageURL == "" {
-		page.ImageURL = parseOpenGraphImage(html)
-		if isPlaceholderImage(page.ImageURL) {
-			pdk.Log(pdk.LogDebug, "discarding placeholder OpenGraph image: "+page.ImageURL)
-			page.ImageURL = ""
-		} else if page.ImageURL != "" {
-			pdk.Log(pdk.LogDebug, "OpenGraph image found: "+page.ImageURL)
-		} else {
-			pdk.Log(pdk.LogDebug, "no OpenGraph image found")
-		}
-	}
-
-	// Parse similar artists
-	page.SimilarArtists = parseSimilarArtists(html)
-
-	pdk.Log(pdk.LogDebug, fmt.Sprintf("parsed page result: bio=%d chars, image=%v, similar=%d",
-		len(page.Biography), page.ImageURL != "", len(page.SimilarArtists)))
-
-	return page
-}
-
-func hasField(page *parsedPageData, field pageField) bool {
-	switch field {
-	case fieldBiography:
-		return page.Biography != ""
-	case fieldImage:
-		return page.ImageURL != ""
-	case fieldSimilar:
-		return len(page.SimilarArtists) > 0
-	default:
-		return page.Biography != "" || page.ImageURL != "" || len(page.SimilarArtists) > 0
-	}
+	return songs, nil
 }

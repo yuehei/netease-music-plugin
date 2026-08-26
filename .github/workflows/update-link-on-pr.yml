@@ -33,6 +33,6 @@ jobs:
               with:
                   number: ${{ steps.pr.outputs.number }}
                   message: |
-                      Download the plugin for this PR: [apple-music.zip](https://nightly.link/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}/apple-music.zip)
+                      Download the plugin for this PR: [netease-music.zip](https://nightly.link/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}/netease-music.zip)
 
                       Built from ${{ github.event.workflow_run.head_sha }} on ${{ github.event.workflow_run.updated_at }}

@@ -1,32 +1,37 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
-	"regexp"
 	"strings"
 
 	"github.com/navidrome/navidrome/plugins/pdk/go/pdk"
 )
 
-type itunesAlbumSearchResponse struct {
-	ResultCount int                 `json:"resultCount"`
-	Results     []itunesAlbumResult `json:"results"`
+type neteaseAlbum struct {
+	ID     int64  `json:"id"`
+	Name   string `json:"name"`
+	PicURL string `json:"picUrl"`
 }
 
-type itunesAlbumResult struct {
-	WrapperType       string `json:"wrapperType"`
-	CollectionName    string `json:"collectionName"`
-	ArtistName        string `json:"artistName"`
-	ArtworkURL100     string `json:"artworkUrl100"`
-	CollectionViewURL string `json:"collectionViewUrl"`
+type neteaseArtistAlbumsResponse struct {
+	Code      int            `json:"code"`
+	HotAlbums []neteaseAlbum `json:"hotAlbums"`
+}
+
+type neteaseAlbumDetailResponse struct {
+	Code  int `json:"code"`
+	Album struct {
+		ID          int64  `json:"id"`
+		Name        string `json:"name"`
+		PicURL      string `json:"picUrl"`
+		Description string `json:"description"`
+	} `json:"album"`
 }
 
 type cachedAlbumMatch struct {
-	ArtworkURL        string `json:"artworkUrl,omitempty"`
-	CollectionViewURL string `json:"collectionViewUrl,omitempty"`
+	AlbumID    int64  `json:"albumId,omitempty"`
+	ArtworkURL string `json:"artworkUrl,omitempty"`
 }
 
 type cachedAlbumInfo struct {
@@ -45,22 +50,18 @@ func extractBaseName(normalized string) string {
 	return strings.TrimSpace(normalized)
 }
 
-func findBestAlbumMatch(albumName string, results []itunesAlbumResult) *itunesAlbumResult {
+func findBestAlbumMatch(albumName string, results []neteaseAlbum) *neteaseAlbum {
 	normalizedAlbum := normalizeName(albumName)
 	baseAlbum := extractBaseName(normalizedAlbum)
 
-	// Filter to collection entries
 	type candidate struct {
 		index          int
 		normalizedName string
 		baseName       string
 	}
-	var candidates []candidate
+	candidates := make([]candidate, 0, len(results))
 	for i := range results {
-		if results[i].WrapperType != "collection" {
-			continue
-		}
-		cn := normalizeName(results[i].CollectionName)
+		cn := normalizeName(results[i].Name)
 		candidates = append(candidates, candidate{
 			index:          i,
 			normalizedName: cn,
@@ -110,17 +111,17 @@ func resolveAlbumMatch(albumName, artistName string) (*cachedAlbumMatch, error) 
 	cacheKey := fmt.Sprintf("album:%s:%s", normalizedArtist, normalizedAlbum)
 	var cached cachedAlbumMatch
 	if kvGet(cacheKey, &cached) {
-		if cached.ArtworkURL == "" && cached.CollectionViewURL == "" {
+		if cached.AlbumID == 0 && cached.ArtworkURL == "" {
 			pdk.Log(pdk.LogDebug, "album negative cache hit: "+cacheKey)
 			return nil, nil
 		}
-		// Pre-0.2.0 cache entries only stored artwork; treat as a miss so the
-		// CollectionViewURL can be populated on re-fetch.
-		if cached.CollectionViewURL != "" {
+		// Legacy cache entries may lack the album ID; treat as a miss so it can
+		// be populated on re-fetch.
+		if cached.AlbumID != 0 {
 			pdk.Log(pdk.LogDebug, "album cache hit: "+cacheKey)
 			return &cached, nil
 		}
-		pdk.Log(pdk.LogDebug, "album cache entry missing URL, refreshing: "+cacheKey)
+		pdk.Log(pdk.LogDebug, "album cache entry missing ID, refreshing: "+cacheKey)
 	}
 
 	// Resolve artist ID first
@@ -133,20 +134,22 @@ func resolveAlbumMatch(albumName, artistName string) (*cachedAlbumMatch, error) 
 		return nil, nil
 	}
 
-	// Look up all albums by artist ID via the iTunes Lookup API
-	lookupURL := fmt.Sprintf("%s?id=%d&entity=album&limit=200", iTunesLookupURL, artistID)
+	// List the artist's albums via the Netease API
+	path := fmt.Sprintf("/artist/album?id=%d&limit=200", artistID)
 
-	pdk.Log(pdk.LogDebug, "looking up albums for artist: "+lookupURL)
-
-	var lookupResp itunesAlbumSearchResponse
-	if err := httpGetJSON(lookupURL, &lookupResp); err != nil {
-		return nil, fmt.Errorf("iTunes album lookup: %w", err)
+	var albumsResp neteaseArtistAlbumsResponse
+	if err := apiGet(path, &albumsResp); err != nil {
+		return nil, fmt.Errorf("Netease artist albums: %w", err)
+	}
+	if albumsResp.Code != 200 {
+		pdk.Log(pdk.LogDebug, fmt.Sprintf("artist albums returned code %d for artist %d", albumsResp.Code, artistID))
+		return nil, nil
 	}
 
 	// Find match by album name (artist already matched via artist ID)
-	bestMatch := findBestAlbumMatch(albumName, lookupResp.Results)
+	bestMatch := findBestAlbumMatch(albumName, albumsResp.HotAlbums)
 
-	if bestMatch == nil || (bestMatch.ArtworkURL100 == "" && bestMatch.CollectionViewURL == "") {
+	if bestMatch == nil || (bestMatch.PicURL == "" && bestMatch.ID == 0) {
 		pdk.Log(pdk.LogDebug, fmt.Sprintf("no matching album found for '%s' by '%s'", albumName, artistName))
 		if err := kvSetWithTTL(cacheKey, cachedAlbumMatch{}, negativeCacheTTLSeconds); err != nil {
 			pdk.Log(pdk.LogWarn, "failed to cache negative album result: "+err.Error())
@@ -155,8 +158,8 @@ func resolveAlbumMatch(albumName, artistName string) (*cachedAlbumMatch, error) 
 	}
 
 	match := &cachedAlbumMatch{
-		ArtworkURL:        bestMatch.ArtworkURL100,
-		CollectionViewURL: stripTrackingParams(bestMatch.CollectionViewURL),
+		AlbumID:    bestMatch.ID,
+		ArtworkURL: bestMatch.PicURL,
 	}
 
 	// Cache with standard TTL
@@ -165,97 +168,25 @@ func resolveAlbumMatch(albumName, artistName string) (*cachedAlbumMatch, error) 
 		pdk.Log(pdk.LogWarn, "failed to cache album match: "+err.Error())
 	}
 
-	pdk.Log(pdk.LogInfo, fmt.Sprintf("resolved album '%s' by '%s' → match", albumName, artistName))
+	pdk.Log(pdk.LogInfo, fmt.Sprintf("resolved album '%s' by '%s' → ID %d", albumName, artistName, bestMatch.ID))
 	return match, nil
 }
 
-func stripTrackingParams(rawURL string) string {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return rawURL
+// fetchAlbumDescription returns the editorial description of an album. The
+// second return value reports whether the fetch succeeded, so the caller can
+// distinguish "no description" (cacheable) from "fetch failed" (retry later).
+func fetchAlbumDescription(albumID int64) (string, bool) {
+	path := fmt.Sprintf("/album?id=%d", albumID)
+
+	var albumResp neteaseAlbumDetailResponse
+	if err := apiGet(path, &albumResp); err != nil {
+		pdk.Log(pdk.LogWarn, fmt.Sprintf("failed to fetch album %d: %s", albumID, err.Error()))
+		return "", false
 	}
-	u.RawQuery = ""
-	u.Fragment = ""
-	return u.String()
-}
-
-var serializedServerDataRegex = regexp.MustCompile(`(?is)<script[^>]*id="serialized-server-data"[^>]*>(.*?)</script>`)
-
-// Mirrors: data[0].data.sections[*].items[*].modalPresentationDescriptor.paragraphText
-type serverDataPage struct {
-	Data []struct {
-		Data struct {
-			Sections []struct {
-				Items []struct {
-					ModalPresentationDescriptor struct {
-						ParagraphText string `json:"paragraphText"`
-					} `json:"modalPresentationDescriptor"`
-				} `json:"items"`
-			} `json:"sections"`
-		} `json:"data"`
-	} `json:"data"`
-}
-
-func parseAlbumDescription(html []byte) string {
-	m := serializedServerDataRegex.FindSubmatch(html)
-	if m == nil {
-		return ""
+	if albumResp.Code != 200 {
+		pdk.Log(pdk.LogWarn, fmt.Sprintf("album detail returned code %d for album %d", albumResp.Code, albumID))
+		return "", false
 	}
 
-	// Apple wraps the page data in an array, but fall back to a single object for robustness.
-	var pages []serverDataPage
-	if err := json.Unmarshal(m[1], &pages); err != nil {
-		var single serverDataPage
-		if err2 := json.Unmarshal(m[1], &single); err2 != nil {
-			pdk.Log(pdk.LogDebug, "failed to parse serialized-server-data: "+err2.Error())
-			return ""
-		}
-		pages = []serverDataPage{single}
-	}
-
-	for _, p := range pages {
-		for _, d := range p.Data {
-			for _, s := range d.Data.Sections {
-				for _, it := range s.Items {
-					if text := normalizeText(it.ModalPresentationDescriptor.ParagraphText); text != "" {
-						return text
-					}
-				}
-			}
-		}
-	}
-	return ""
-}
-
-// The second return value reports whether any fetch succeeded, so the caller
-// can distinguish "no notes" (cacheable) from "all fetches failed" (retry later).
-func fetchAlbumDescription(collectionViewURL string) (string, bool) {
-	countries := getCountries()
-	anySuccess := false
-	for _, country := range countries {
-		pageURL := rewriteAlbumURLCountry(collectionViewURL, country)
-		pdk.Log(pdk.LogDebug, "fetching Apple Music album page: "+pageURL)
-
-		body, statusCode, err := httpGet(pageURL)
-		if err != nil {
-			pdk.Log(pdk.LogWarn, fmt.Sprintf("failed to fetch album page for country %s: %s", country, err.Error()))
-			continue
-		}
-		if statusCode != 200 {
-			pdk.Log(pdk.LogWarn, fmt.Sprintf("album page returned %d for country %s", statusCode, country))
-			continue
-		}
-
-		anySuccess = true
-		if description := parseAlbumDescription(body); description != "" {
-			return description, true
-		}
-	}
-	return "", anySuccess
-}
-
-var albumURLCountryRegex = regexp.MustCompile(`^(https?://music\.apple\.com/)[a-z]{2}(/album/)`)
-
-func rewriteAlbumURLCountry(albumURL, country string) string {
-	return albumURLCountryRegex.ReplaceAllString(albumURL, "${1}"+country+"${2}")
+	return normalizeText(albumResp.Album.Description), true
 }

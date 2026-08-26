@@ -50,5 +50,5 @@ jobs:
             - name: Upload artifact
               uses: actions/upload-artifact@v7
               with:
-                  name: apple-music
-                  path: apple-music.ndp
+                  name: netease-music
+                  path: netease-music.ndp

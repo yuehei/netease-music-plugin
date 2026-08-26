@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
-	"regexp"
+	"math/rand/v2"
+	"net/url"
 	"strings"
 
 	"github.com/navidrome/navidrome/plugins/pdk/go/host"
@@ -11,23 +13,87 @@ import (
 	"github.com/navidrome/navidrome/plugins/pdk/go/pdk"
 )
 
-func getCountries() []string {
-	val, exists := host.ConfigGet(configCountries)
+// getAPIEndpoints returns the configured Netease Cloud Music API base URLs.
+// The config value holds one URL per line; blank lines are skipped and
+// trailing slashes are stripped so endpoints can be joined with paths directly.
+// Returns nil when nothing is configured — the plugin has no built-in default
+// endpoint and must be configured after installation.
+func getAPIEndpoints() []string {
+	val, exists := host.ConfigGet(configAPIEndpoints)
 	if !exists || strings.TrimSpace(val) == "" {
-		return []string{defaultCountry}
+		return nil
 	}
-	parts := strings.Split(val, ",")
-	countries := make([]string, 0, len(parts))
+	parts := strings.Split(val, "\n")
+	endpoints := make([]string, 0, len(parts))
 	for _, p := range parts {
-		p = strings.TrimSpace(strings.ToLower(p))
+		p = strings.TrimRight(strings.TrimSpace(p), "/")
 		if p != "" {
-			countries = append(countries, p)
+			endpoints = append(endpoints, p)
 		}
 	}
-	if len(countries) == 0 {
-		return []string{defaultCountry}
+	return endpoints
+}
+
+// errNoAPIEndpoint is returned by apiGet when no API endpoint is configured.
+var errNoAPIEndpoint = errors.New("api_endpoints not configured: set at least one API endpoint in the plugin settings")
+
+// randomAPIEndpoint picks one of the configured endpoints at random, so
+// multiple configured mirrors share the request load. Returns "" when no
+// endpoint is configured.
+func randomAPIEndpoint() string {
+	endpoints := getAPIEndpoints()
+	if len(endpoints) == 0 {
+		return ""
 	}
-	return countries
+	return endpoints[rand.IntN(len(endpoints))]
+}
+
+// getMusicU returns the configured Netease MUSIC_U cookie value, or "" when
+// not set. Endpoints that require login (e.g. /simi/artist) only work when
+// this is configured.
+func getMusicU() string {
+	val, exists := host.ConfigGet(configMusicU)
+	if !exists {
+		return ""
+	}
+	return strings.TrimSpace(val)
+}
+
+// apiGet fetches a Netease Cloud Music API path (e.g. "/artist/detail?id=123")
+// from a randomly picked configured endpoint and unmarshals the JSON body into
+// target. When a MUSIC_U cookie is configured it is passed via the `cookie`
+// query parameter, which the API service forwards to Netease. Callers must
+// check the response `code` field for API-level errors (e.g. 301 = login
+// required).
+func apiGet(path string, target any) error {
+	endpoint := randomAPIEndpoint()
+	if endpoint == "" {
+		pdk.Log(pdk.LogWarn, "api_endpoints not configured: set at least one API endpoint in the plugin settings")
+		return errNoAPIEndpoint
+	}
+	reqURL := endpoint + path
+	logURL := reqURL
+	if musicU := getMusicU(); musicU != "" {
+		sep := "?"
+		if strings.Contains(path, "?") {
+			sep = "&"
+		}
+		reqURL += sep + "cookie=" + url.QueryEscape("MUSIC_U="+musicU)
+	}
+
+	pdk.Log(pdk.LogDebug, "fetching Netease API: "+logURL)
+
+	body, statusCode, err := httpGet(reqURL)
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	if statusCode != 200 {
+		return fmt.Errorf("returned status %d", statusCode)
+	}
+	if err := json.Unmarshal(body, target); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+	return nil
 }
 
 // isEnabled checks if a capability is enabled. Defaults to true; "false" disables.
@@ -117,9 +183,9 @@ func normalizeName(name string) string {
 // non-breaking and narrow no-break spaces, etc.) within each line into single
 // regular spaces, while preserving line breaks so the paragraph structure of
 // editorial notes and biographies survives. Leading/trailing blank space is
-// trimmed. Apple emits tabs and exotic White_Space code points between words in
-// some notes; strings.Fields (which splits on unicode.IsSpace) collapses them
-// per line, and splitting on newlines first keeps the paragraph breaks intact.
+// trimmed. strings.Fields (which splits on unicode.IsSpace) collapses the
+// whitespace per line, and splitting on newlines first keeps the paragraph
+// breaks intact.
 func normalizeText(s string) string {
 	s = strings.ReplaceAll(s, "\r\n", "\n")
 	s = strings.ReplaceAll(s, "\r", "\n")
@@ -130,10 +196,17 @@ func normalizeText(s string) string {
 	return strings.TrimSpace(strings.Join(lines, "\n"))
 }
 
-var imageURLRegex = regexp.MustCompile(`/\d+x\d+[a-z]*\.`)
-
-func rewriteImageSize(imageURL string, size int) string {
-	return imageURLRegex.ReplaceAllString(imageURL, fmt.Sprintf("/%dx%dbb.", size, size))
+// resizeImageURL rewrites a Netease image URL (p*.music.126.net) to request a
+// specific square size via the `param` query argument (format: {w}y{h}). The
+// scheme is forced to https and any existing query string is replaced.
+func resizeImageURL(imageURL string, size int) string {
+	u, err := url.Parse(imageURL)
+	if err != nil {
+		return imageURL
+	}
+	u.Scheme = "https"
+	u.RawQuery = fmt.Sprintf("param=%dy%d", size, size)
+	return u.String()
 }
 
 func buildImageList(baseURL string) []metadata.ImageInfo {
@@ -141,7 +214,7 @@ func buildImageList(baseURL string) []metadata.ImageInfo {
 	images := make([]metadata.ImageInfo, 0, len(sizes))
 	for _, size := range sizes {
 		images = append(images, metadata.ImageInfo{
-			URL:  rewriteImageSize(baseURL, size),
+			URL:  resizeImageURL(baseURL, size),
 			Size: int32(size),
 		})
 	}

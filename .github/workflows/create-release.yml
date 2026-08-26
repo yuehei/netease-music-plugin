@@ -85,5 +85,5 @@ jobs:
                   tag_name: v${{ env.VERSION }}
                   draft: true
                   prerelease: ${{ inputs.beta != '' && inputs.beta != '0' }}
-                  files: apple-music.ndp
+                  files: netease-music.ndp
                   generate_release_notes: true

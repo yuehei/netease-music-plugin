@@ -12,9 +12,9 @@ import (
 	. "github.com/onsi/gomega"
 )
 
-func TestAppleMusicPlugin(t *testing.T) {
+func TestNeteaseMusicPlugin(t *testing.T) {
 	RegisterFailHandler(Fail)
-	RunSpecs(t, "Apple Music Plugin Suite")
+	RunSpecs(t, "Netease Music Plugin Suite")
 }
 
 var _ = BeforeEach(resetMocks)

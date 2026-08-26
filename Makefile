@@ -1,7 +1,7 @@
 SHELL := /usr/bin/env bash
 .PHONY: test build package clean
 
-PLUGIN_NAME := apple-music
+PLUGIN_NAME := netease-music
 WASM_FILE := plugin.wasm
 TINYGO := $(shell command -v tinygo 2> /dev/null)
 

@@ -1,4 +1,4 @@
-module github.com/navidrome/apple-music-plugin
+module github.com/yuehei/netease-music-plugin
 
 go 1.25.0
 
