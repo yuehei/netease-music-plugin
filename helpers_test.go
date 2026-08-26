@@ -199,6 +199,16 @@ var _ = Describe("helpers", func() {
 			Expect(err.Error()).To(ContainSubstring("rate limited"))
 		})
 
+		It("tries at most maxEndpointAttempts mirrors even when more are configured", func() {
+			host.ConfigMock.On("Get", configAPIEndpoints).Return("https://a.example.com\nhttps://b.example.com\nhttps://c.example.com", true)
+			host.ConfigMock.On("Get", configMusicU).Return("", false)
+			host.HTTPMock.On("Send", mock.Anything).Return(&host.HTTPResponse{StatusCode: 502, Body: []byte("bad gateway")}, nil)
+
+			var out struct{}
+			Expect(apiGet("/test", &out)).To(HaveOccurred())
+			host.HTTPMock.AssertNumberOfCalls(GinkgoT(), "Send", 2)
+		})
+
 		It("does not treat non-retryable API codes as endpoint failure", func() {
 			host.ConfigMock.On("Get", configAPIEndpoints).Return("https://api.example.com", true)
 			host.ConfigMock.On("Get", configMusicU).Return("", false)

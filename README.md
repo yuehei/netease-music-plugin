@@ -16,7 +16,7 @@ It provides artist biographies, images, similar artists, top songs, album artwor
 - Discovers similar artists via `/simi/artist` (requires login cookie)
 - Fetches artist hot songs via `/artist/top/song`
 - Provides Netease Cloud Music artist page URLs
-- Multiple API endpoints: configure several mirrors — tried in random order per request with automatic failover when a mirror is down or rate-limited
+- Multiple API endpoints: configure several mirrors — random order per request with one automatic failover when a mirror is down or rate-limited
 - Aggressive caching with negative caching (2-hour TTL for "not found" results) to minimize external requests
 
 ## Installation
@@ -102,7 +102,7 @@ The plugin implements seven metadata provider capabilities:
 2. **Artist detail** — Fetches `/artist/detail?id=…` for biography and images (one call serves both capabilities)
 3. **Similar artists** — Fetches `/simi/artist?id=…` with the configured cookie; degrades gracefully on `301`
 4. **Album lookup** — Resolves the artist ID, lists the artist's albums via `/artist/album?id=…&limit=200`, then matches the album name locally
-5. **Endpoint selection** — Endpoints are tried in random order per request; when a mirror is unreachable (transport error, non-200 status) or rate-limited (API code 405/429/460/462) the next mirror is tried automatically, and an error is returned only when every mirror fails
+5. **Endpoint selection** — Up to 2 endpoints are tried in random order per request (first pick + one failover); when a mirror is unreachable (transport error, non-200 status) or rate-limited (API code 405/429/460/462) one other mirror is tried automatically, and an error is returned when the attempt budget is exhausted
 6. **Caching** — Stores results in KVStore with configurable TTL; caches genuine "not found" results (API code 200 with empty results) with a 2-hour TTL to avoid repeated lookups. Rate limiting and other API-level failures are NOT cached, so the next scan retries them
 
 ### Data Sources

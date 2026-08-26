@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/navidrome/navidrome/plugins/pdk/go/metadata"
 	"github.com/navidrome/navidrome/plugins/pdk/go/pdk"
@@ -77,6 +78,21 @@ func readCachedArtistID(cacheKey string) (int64, bool) {
 	return cached.ArtistID, true
 }
 
+// artistResolveCall tracks one in-flight resolveArtistID call. Concurrent
+// callers for the same artist wait on done and then share the leader's
+// result — success, "not found", AND failure — so a burst of capability
+// calls issues only one /search even when the upstream is rate-limiting.
+// The result lives only in memory for the current burst; nothing is
+// persisted, keeping the "no negative cache on rate limiting" rule.
+type artistResolveCall struct {
+	done chan struct{}
+	id   int64
+	err  error
+}
+
+// artistResolveInflight maps an artist cache key to its in-flight call.
+var artistResolveInflight sync.Map // string -> *artistResolveCall
+
 func resolveArtistID(artistName string) (int64, error) {
 	normalized := normalizeName(artistName)
 	if normalized == "" {
@@ -89,11 +105,27 @@ func resolveArtistID(artistName string) (int64, error) {
 		return id, nil
 	}
 
-	// Serialize concurrent resolutions for this artist: wait for any in-flight
-	// fetch, then re-check the cache before hitting the API ourselves.
-	mu := lockForKey(cacheKey)
-	mu.Lock()
-	defer mu.Unlock()
+	// Join or start the in-flight resolution for this artist.
+	call := &artistResolveCall{done: make(chan struct{})}
+	if actual, loaded := artistResolveInflight.LoadOrStore(cacheKey, call); loaded {
+		shared := actual.(*artistResolveCall)
+		<-shared.done
+		return shared.id, shared.err
+	}
+
+	// Leader: LIFO defers close(done) before deleting the map entry, so
+	// waiters always observe the published result.
+	defer artistResolveInflight.Delete(cacheKey)
+	defer close(call.done)
+	call.id, call.err = resolveArtistIDFetch(cacheKey, artistName, normalized)
+	return call.id, call.err
+}
+
+// resolveArtistIDFetch performs the actual /search lookup and cache writes.
+// Called only by the resolveArtistID leader.
+func resolveArtistIDFetch(cacheKey, artistName, normalized string) (int64, error) {
+	// Double-check: a just-finished leader may have populated the cache
+	// between our fast-path check and becoming the leader.
 	if id, ok := readCachedArtistID(cacheKey); ok {
 		return id, nil
 	}
@@ -170,23 +202,12 @@ func findBestArtistMatch(query string, results []neteaseArtist) *neteaseArtist {
 
 // fetchArtistPage returns the artist's biography and image, from cache when
 // available. An entry with both fields empty is a valid (negative) cache entry.
-// Concurrent calls for the same artist ID share one upstream fetch via the
-// per-key lock.
 func fetchArtistPage(artistID int64) (*cachedArtistPage, error) {
 	cacheKey := fmt.Sprintf("page:%d", artistID)
 
 	var cached cachedArtistPage
 	if kvGet(cacheKey, &cached) {
 		pdk.Log(pdk.LogDebug, "page cache hit: "+cacheKey)
-		return &cached, nil
-	}
-
-	mu := lockForKey(cacheKey)
-	mu.Lock()
-	defer mu.Unlock()
-
-	if kvGet(cacheKey, &cached) {
-		pdk.Log(pdk.LogDebug, "page cache hit after wait: "+cacheKey)
 		return &cached, nil
 	}
 

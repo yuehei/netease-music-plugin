@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"strings"
 
 	"github.com/navidrome/navidrome/plugins/pdk/go/host"
@@ -136,6 +137,38 @@ var _ = Describe("artist", func() {
 
 			_, err := resolveArtistID("X")
 			Expect(err).To(HaveOccurred())
+		})
+
+		It("shares an in-flight success with concurrent callers", func() {
+			host.KVStoreMock.On("Get", "artist:shared").Return([]byte(nil), false, nil)
+
+			// Pre-register a completed in-flight call: resolveArtistID must join
+			// it and return the shared result without any HTTP request (no HTTP
+			// mock is registered, so an unexpected Send would panic the mock).
+			call := &artistResolveCall{done: make(chan struct{})}
+			call.id = 4242
+			close(call.done)
+			artistResolveInflight.Store("artist:shared", call)
+			defer artistResolveInflight.Delete("artist:shared")
+
+			id, err := resolveArtistID("Shared")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(id).To(Equal(int64(4242)))
+		})
+
+		It("shares an in-flight failure with concurrent callers", func() {
+			host.KVStoreMock.On("Get", "artist:badburst").Return([]byte(nil), false, nil)
+
+			rateLimited := errors.New("endpoint attempts exhausted: rate limited (code 460)")
+			call := &artistResolveCall{done: make(chan struct{})}
+			call.err = rateLimited
+			close(call.done)
+			artistResolveInflight.Store("artist:badburst", call)
+			defer artistResolveInflight.Delete("artist:badburst")
+
+			id, err := resolveArtistID("Badburst")
+			Expect(err).To(MatchError(rateLimited))
+			Expect(id).To(Equal(int64(0)))
 		})
 	})
 

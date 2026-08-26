@@ -7,7 +7,6 @@ import (
 	"math/rand/v2"
 	"net/url"
 	"strings"
-	"sync"
 
 	"github.com/navidrome/navidrome/plugins/pdk/go/host"
 	"github.com/navidrome/navidrome/plugins/pdk/go/metadata"
@@ -37,19 +36,6 @@ func getAPIEndpoints() []string {
 
 // errNoAPIEndpoint is returned by apiGet when no API endpoint is configured.
 var errNoAPIEndpoint = errors.New("api_endpoints not configured: set at least one API endpoint in the plugin settings")
-
-// resolveLocks holds one mutex per cache key so concurrent capability calls
-// for the same artist/album share a single upstream fetch: the loser waits on
-// the mutex and then finds the winner's result in the cache (double-checked
-// locking). Entries are never removed — the memory cost is one mutex per
-// resolved name, negligible even for large libraries.
-var resolveLocks sync.Map // string -> *sync.Mutex
-
-// lockForKey returns the mutex serializing resolutions for the given cache key.
-func lockForKey(key string) *sync.Mutex {
-	mu, _ := resolveLocks.LoadOrStore(key, &sync.Mutex{})
-	return mu.(*sync.Mutex)
-}
 
 // retryableAPICodes are Netease API-level codes worth retrying on another
 // mirror: rate limiting is enforced per source IP, so a mirror returning one
@@ -85,20 +71,28 @@ func getMusicU() string {
 	return strings.TrimSpace(val)
 }
 
+// maxEndpointAttempts caps how many mirrors a single apiGet call may hit:
+// the random first pick plus ONE fallback. Bounds worst-case latency at
+// 2 × httpTimeoutMs when mirrors are down or rate-limited.
+const maxEndpointAttempts = 2
+
 // apiGet fetches a Netease Cloud Music API path (e.g. "/artist/detail?id=123")
 // from the configured endpoints and unmarshals the JSON body into target.
-// Endpoints are tried in random order: when a mirror is unreachable (transport
-// error or non-200 HTTP status) or rate-limited (API code in retryableAPICodes)
-// the next mirror is tried, and only when every mirror fails is an error
-// returned. When a MUSIC_U cookie is configured it is passed via the `cookie`
-// query parameter, which the API service forwards to Netease. Callers must
-// check the response `code` field for non-retryable API-level errors (e.g.
-// 301 = login required).
+// Up to maxEndpointAttempts mirrors are tried in random order: when a mirror
+// is unreachable (transport error or non-200 HTTP status) or rate-limited
+// (API code in retryableAPICodes) ONE other mirror is tried, and an error is
+// returned when the attempt budget is exhausted. When a MUSIC_U cookie is
+// configured it is passed via the `cookie` query parameter, which the API
+// service forwards to Netease. Callers must check the response `code` field
+// for non-retryable API-level errors (e.g. 301 = login required).
 func apiGet(path string, target any) error {
 	endpoints := shuffledAPIEndpoints()
 	if len(endpoints) == 0 {
 		pdk.Log(pdk.LogWarn, "api_endpoints not configured: set at least one API endpoint in the plugin settings")
 		return errNoAPIEndpoint
+	}
+	if len(endpoints) > maxEndpointAttempts {
+		endpoints = endpoints[:maxEndpointAttempts]
 	}
 
 	cookieParam := ""
@@ -137,7 +131,7 @@ func apiGet(path string, target any) error {
 		}
 		pdk.Log(pdk.LogDebug, "endpoint attempt failed, trying next: "+lastErr.Error())
 	}
-	return fmt.Errorf("all endpoints failed: %w", lastErr)
+	return fmt.Errorf("endpoint attempts exhausted: %w", lastErr)
 }
 
 // isEnabled checks if a capability is enabled. Defaults to true; "false" disables.

@@ -134,14 +134,6 @@ func resolveAlbumMatch(albumName, artistName string) (*cachedAlbumMatch, error) 
 		return match, nil
 	}
 
-	// Serialize concurrent resolutions for this album (see resolveArtistID).
-	mu := lockForKey(cacheKey)
-	mu.Lock()
-	defer mu.Unlock()
-	if match, ok := readCachedAlbumMatch(cacheKey); ok {
-		return match, nil
-	}
-
 	// Resolve artist ID first
 	artistID, err := resolveArtistID(artistName)
 	if err != nil {
