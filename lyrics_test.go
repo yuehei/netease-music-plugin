@@ -79,7 +79,7 @@ var _ = Describe("lyrics", func() {
 		It("searches and caches the song ID with the configured TTL", func() {
 			host.KVStoreMock.On("Get", "song:周杰伦:晴天").Return([]byte(nil), false, nil)
 			mockAPIConfig()
-			host.ConfigMock.On("GetInt", configCacheTTLDays).Return(int64(7), true)
+			host.ConfigMock.On("GetInt", configLyricsCacheTTLDays).Return(int64(7), true)
 
 			searchResp := neteaseSongSearchResponse{Code: 200}
 			searchResp.Result.Songs = []neteaseSong{{ID: 186016, Name: "晴天"}}
@@ -112,7 +112,7 @@ var _ = Describe("lyrics", func() {
 		It("fetches from /lyric/new and caches text, translation and track path", func() {
 			host.KVStoreMock.On("Get", "lyrics:186016").Return([]byte(nil), false, nil)
 			mockAPIConfig()
-			host.ConfigMock.On("GetInt", configCacheTTLDays).Return(int64(7), true)
+			host.ConfigMock.On("GetInt", configLyricsCacheTTLDays).Return(int64(7), true)
 
 			var lyricResp neteaseLyricResponse
 			lyricResp.Code = 200
@@ -148,7 +148,7 @@ var _ = Describe("lyrics", func() {
 		It("falls back to /lyric when /lyric/new has no lyrics", func() {
 			host.KVStoreMock.On("Get", "lyrics:186016").Return([]byte(nil), false, nil)
 			mockAPIConfig()
-			host.ConfigMock.On("GetInt", configCacheTTLDays).Return(int64(7), true)
+			host.ConfigMock.On("GetInt", configLyricsCacheTTLDays).Return(int64(7), true)
 
 			mockHTTPJSON("/lyric/new?id=186016", neteaseLyricResponse{Code: 200})
 
@@ -167,7 +167,7 @@ var _ = Describe("lyrics", func() {
 		It("negative-caches empty lyrics", func() {
 			host.KVStoreMock.On("Get", "lyrics:186016").Return([]byte(nil), false, nil)
 			mockAPIConfig()
-			host.ConfigMock.On("GetInt", configCacheTTLDays).Return(int64(7), true)
+			host.ConfigMock.On("GetInt", configLyricsCacheTTLDays).Return(int64(7), true)
 
 			mockHTTPJSON("/lyric/new?id=186016", neteaseLyricResponse{Code: 200})
 			mockHTTPJSON("/lyric?id=186016", neteaseLyricResponse{Code: 200})
@@ -181,6 +181,63 @@ var _ = Describe("lyrics", func() {
 		})
 	})
 
+	Describe("getLyricsCacheTTLSeconds", func() {
+		It("falls back to the default when unset", func() {
+			host.ConfigMock.On("GetInt", configLyricsCacheTTLDays).Return(int64(0), false)
+			Expect(getLyricsCacheTTLSeconds()).To(Equal(int64(7 * 24 * 60 * 60)))
+		})
+
+		It("falls back to the default when invalid", func() {
+			host.ConfigMock.On("GetInt", configLyricsCacheTTLDays).Return(int64(0), true)
+			Expect(getLyricsCacheTTLSeconds()).To(Equal(int64(7 * 24 * 60 * 60)))
+		})
+
+		It("uses the dedicated lyrics TTL when configured", func() {
+			host.ConfigMock.On("GetInt", configLyricsCacheTTLDays).Return(int64(30), true)
+			Expect(getLyricsCacheTTLSeconds()).To(Equal(int64(30 * 24 * 60 * 60)))
+		})
+	})
+
+	Describe("mergeLrcByTimeline", func() {
+		It("appends matching translations in fullwidth parentheses", func() {
+			orig := "[00:01.00]晴天\n[00:02.50]小雨\n[03:00.00]outro"
+			trans := "[00:01.00]sunny\n[00:02.50]drizzle\n[00:09.00]extra"
+			Expect(mergeLrcByTimeline(orig, trans)).To(Equal(
+				"[00:01.00]晴天（sunny）\n[00:02.50]小雨（drizzle）\n[03:00.00]outro"))
+		})
+
+		It("matches timestamps regardless of fractional precision", func() {
+			orig := "[00:01.000]hello"
+			trans := "[00:01.00]你好"
+			Expect(mergeLrcByTimeline(orig, trans)).To(Equal("[00:01.000]hello（你好）"))
+		})
+
+		It("keeps the full tag prefix of multi-tag lines", func() {
+			orig := "[00:05.00][00:40.00]repeat"
+			trans := "[00:05.00]X"
+			Expect(mergeLrcByTimeline(orig, trans)).To(Equal("[00:05.00][00:40.00]repeat（X）"))
+		})
+
+		It("leaves lines without timestamps and translation-only lines alone", func() {
+			orig := "plain header\n[00:01.00]晴天"
+			trans := "no tag here\n[00:01.00]sunny"
+			Expect(mergeLrcByTimeline(orig, trans)).To(Equal(
+				"plain header\n[00:01.00]晴天（sunny）"))
+		})
+
+		It("returns the original when the translation has no timestamps", func() {
+			orig := "[00:01.00]晴天"
+			Expect(mergeLrcByTimeline(orig, "纯文本翻译")).To(Equal(orig))
+		})
+
+		It("normalizes CRLF line endings and trims text when merging", func() {
+			orig := "[00:01.00]晴天 \r\n[00:02.50]小雨"
+			trans := "[00:01.00]sunny\r\n[00:02.50]drizzle"
+			Expect(mergeLrcByTimeline(orig, trans)).To(Equal(
+				"[00:01.00]晴天（sunny）\n[00:02.50]小雨（drizzle）"))
+		})
+	})
+
 	Describe("GetLyrics", func() {
 		var agent neteaseMusicAgent
 
@@ -188,6 +245,13 @@ var _ = Describe("lyrics", func() {
 		// is false, so specs must turn it on explicitly).
 		enableLyrics := func() {
 			host.ConfigMock.On("Get", configLyrics).Return("true", true)
+		}
+
+		// unsetDisplayMode registers the display mode as unset (manifest
+		// default "original"). Not defaulted in resetMocks so mode specs
+		// can register their own value without order shadowing.
+		unsetDisplayMode := func() {
+			host.ConfigMock.On("Get", configLyricsDisplayMode).Return("", false).Maybe()
 		}
 
 		setupSongAndLyrics := func() {
@@ -200,6 +264,7 @@ var _ = Describe("lyrics", func() {
 
 		It("returns the original first and the translation second when available", func() {
 			enableLyrics()
+			unsetDisplayMode()
 			setupSongAndLyrics()
 
 			resp, err := agent.GetLyrics(lyrics.GetLyricsRequest{Track: lyrics.TrackInfo{
@@ -215,8 +280,88 @@ var _ = Describe("lyrics", func() {
 			Expect(resp.Lyrics[1].Text).To(Equal("[00:01.00]sunny day"))
 		})
 
+		It("returns a single timeline-merged entry in bilingual mode", func() {
+			enableLyrics()
+			host.ConfigMock.On("Get", configLyricsDisplayMode).Return("bilingual", true)
+			setupSongAndLyrics()
+
+			resp, err := agent.GetLyrics(lyrics.GetLyricsRequest{Track: lyrics.TrackInfo{
+				Artist: "周杰伦",
+				Title:  "晴天",
+			}})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(resp.Lyrics).To(HaveLen(1))
+			Expect(resp.Lyrics[0].Lang).To(BeEmpty())
+			Expect(resp.Lyrics[0].Text).To(Equal("[00:01.00]晴天（sunny day）"))
+		})
+
+		It("returns a single translation entry in chinese mode", func() {
+			enableLyrics()
+			host.ConfigMock.On("Get", configLyricsDisplayMode).Return("chinese", true)
+			setupSongAndLyrics()
+
+			resp, err := agent.GetLyrics(lyrics.GetLyricsRequest{Track: lyrics.TrackInfo{
+				Artist: "周杰伦",
+				Title:  "晴天",
+			}})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(resp.Lyrics).To(HaveLen(1))
+			Expect(resp.Lyrics[0].Lang).To(BeEmpty())
+			Expect(resp.Lyrics[0].Text).To(Equal("[00:01.00]sunny day"))
+		})
+
+		It("falls back to the original when bilingual mode has no translation", func() {
+			enableLyrics()
+			host.ConfigMock.On("Get", configLyricsDisplayMode).Return("bilingual", true)
+			host.KVStoreMock.On("Get", "song:周杰伦:晴天").Return(mustMarshal(cachedSongID{SongID: 186016}), true, nil)
+			host.KVStoreMock.On("Get", "lyrics:186016").Return(mustMarshal(cachedLyrics{
+				Text: "[00:01.00]晴天",
+			}), true, nil)
+
+			resp, err := agent.GetLyrics(lyrics.GetLyricsRequest{Track: lyrics.TrackInfo{
+				Artist: "周杰伦",
+				Title:  "晴天",
+			}})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(resp.Lyrics).To(HaveLen(1))
+			Expect(resp.Lyrics[0].Text).To(Equal("[00:01.00]晴天"))
+		})
+
+		It("falls back to the original when chinese mode has no translation", func() {
+			enableLyrics()
+			host.ConfigMock.On("Get", configLyricsDisplayMode).Return("chinese", true)
+			host.KVStoreMock.On("Get", "song:周杰伦:晴天").Return(mustMarshal(cachedSongID{SongID: 186016}), true, nil)
+			host.KVStoreMock.On("Get", "lyrics:186016").Return(mustMarshal(cachedLyrics{
+				Text: "[00:01.00]晴天",
+			}), true, nil)
+
+			resp, err := agent.GetLyrics(lyrics.GetLyricsRequest{Track: lyrics.TrackInfo{
+				Artist: "周杰伦",
+				Title:  "晴天",
+			}})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(resp.Lyrics).To(HaveLen(1))
+			Expect(resp.Lyrics[0].Text).To(Equal("[00:01.00]晴天"))
+		})
+
+		It("treats an unknown display mode as the default", func() {
+			enableLyrics()
+			host.ConfigMock.On("Get", configLyricsDisplayMode).Return("weird", true)
+			setupSongAndLyrics()
+
+			resp, err := agent.GetLyrics(lyrics.GetLyricsRequest{Track: lyrics.TrackInfo{
+				Artist: "周杰伦",
+				Title:  "晴天",
+			}})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(resp.Lyrics).To(HaveLen(2))
+			Expect(resp.Lyrics[0].Text).To(Equal("[00:01.00]晴天"))
+			Expect(resp.Lyrics[1].Text).To(Equal("[00:01.00]sunny day"))
+		})
+
 		It("returns only the original when no translation exists", func() {
 			enableLyrics()
+			unsetDisplayMode()
 			host.KVStoreMock.On("Get", "song:周杰伦:晴天").Return(mustMarshal(cachedSongID{SongID: 186016}), true, nil)
 			host.KVStoreMock.On("Get", "lyrics:186016").Return(mustMarshal(cachedLyrics{
 				Text: "[00:01.00]晴天",
@@ -265,10 +410,11 @@ var _ = Describe("lyrics", func() {
 
 		It("records the requested track path in the lyrics cache", func() {
 			enableLyrics()
+			unsetDisplayMode()
 			host.KVStoreMock.On("Get", "song:周杰伦:晴天").Return(mustMarshal(cachedSongID{SongID: 186016}), true, nil)
 			host.KVStoreMock.On("Get", "lyrics:186016").Return([]byte(nil), false, nil)
 			mockAPIConfig()
-			host.ConfigMock.On("GetInt", configCacheTTLDays).Return(int64(7), true)
+			host.ConfigMock.On("GetInt", configLyricsCacheTTLDays).Return(int64(7), true)
 
 			var lyricResp neteaseLyricResponse
 			lyricResp.Code = 200
@@ -291,7 +437,7 @@ var _ = Describe("lyrics", func() {
 		It("normalizes JSON meta lines when fetching lyrics", func() {
 			host.KVStoreMock.On("Get", "lyrics:186016").Return([]byte(nil), false, nil)
 			mockAPIConfig()
-			host.ConfigMock.On("GetInt", configCacheTTLDays).Return(int64(7), true)
+			host.ConfigMock.On("GetInt", configLyricsCacheTTLDays).Return(int64(7), true)
 
 			var lyricResp neteaseLyricResponse
 			lyricResp.Code = 200

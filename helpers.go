@@ -156,6 +156,16 @@ func getCacheTTLSeconds() int64 {
 	return days * 24 * 60 * 60
 }
 
+// getLyricsCacheTTLSeconds returns the TTL for lyrics-related cache entries
+// (song ID mappings and lyric texts), independent of the metadata cache TTL.
+func getLyricsCacheTTLSeconds() int64 {
+	days, exists := host.ConfigGetInt(configLyricsCacheTTLDays)
+	if !exists || days <= 0 {
+		days = defaultLyricsCacheTTL
+	}
+	return days * 24 * 60 * 60
+}
+
 func kvGet(key string, target any) bool {
 	data, exists, err := host.KVStoreGet(key)
 	if err != nil {

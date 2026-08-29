@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/navidrome/navidrome/plugins/pdk/go/host"
 	"github.com/navidrome/navidrome/plugins/pdk/go/lyrics"
 	"github.com/navidrome/navidrome/plugins/pdk/go/metadata"
 	"github.com/navidrome/navidrome/plugins/pdk/go/pdk"
@@ -33,24 +34,34 @@ const (
 	neteaseArtistURL        = "https://music.163.com/#/artist?id=%d"
 	neteaseAlbumURL         = "https://music.163.com/#/album?id=%d"
 	defaultCacheTTL         = 7 // days
+	defaultLyricsCacheTTL   = 7 // days
 	defaultTopSongs         = 10
 	httpTimeoutMs           = 10000
 	negativeCacheTTLSeconds = 7200 // 2 hours
 
 	// Config keys
-	configAPIEndpoints     = "api_endpoints"
-	configMusicU           = "music_u"
-	configCacheTTLDays     = "cache_ttl_days"
-	configArtistExactMatch = "artist_exact_match"
-	configArtistIDOverride = "artist_id_overrides"
-	configArtistURL        = "enable_artist_url"
-	configArtistBiography = "enable_artist_biography"
-	configArtistImages    = "enable_artist_images"
-	configSimilarArtists  = "enable_similar_artists"
-	configTopSongs        = "enable_top_songs"
-	configLyrics          = "enable_lyrics"
-	configAlbumImages     = "enable_album_images"
-	configAlbumInfo       = "enable_album_info"
+	configAPIEndpoints       = "api_endpoints"
+	configMusicU             = "music_u"
+	configCacheTTLDays       = "cache_ttl_days"
+	configLyricsCacheTTLDays = "lyrics_cache_ttl_days"
+	configLyricsDisplayMode  = "lyrics_display_mode"
+	configArtistExactMatch   = "artist_exact_match"
+	configArtistIDOverride   = "artist_id_overrides"
+	configArtistURL          = "enable_artist_url"
+	configArtistBiography    = "enable_artist_biography"
+	configArtistImages       = "enable_artist_images"
+	configSimilarArtists     = "enable_similar_artists"
+	configTopSongs           = "enable_top_songs"
+	configLyrics             = "enable_lyrics"
+	configAlbumImages        = "enable_album_images"
+	configAlbumInfo          = "enable_album_info"
+)
+
+// Lyrics display modes (lyrics_display_mode).
+const (
+	displayModeOriginal  = "original"  // 原文 + 翻译两条，由客户端选择（默认）
+	displayModeBilingual = "bilingual" // 按时间轴合并为一条"原文（译文）"
+	displayModeChinese   = "chinese"   // 仅中文翻译
 )
 
 // Compile-time interface assertions
@@ -288,10 +299,10 @@ func (a *neteaseMusicAgent) GetAlbumInfo(input metadata.AlbumRequest) (*metadata
 }
 
 // GetLyrics returns the track's lyrics from Netease Cloud Music as LRC text,
-// optionally with the Chinese translation as a second entry. The song is
-// located by artist:title search and both the song ID and the lyrics are
-// cached with the configured TTL. When no lyrics exist, errLyricsNotFound
-// lets Navidrome fall through to the next lyrics agent.
+// optionally with the Chinese translation, shaped by lyrics_display_mode.
+// The song is located by artist:title search and both the song ID and the
+// lyrics are cached with the lyrics-specific TTL. When no lyrics exist,
+// errLyricsNotFound lets Navidrome fall through to the next lyrics agent.
 func (a *neteaseMusicAgent) GetLyrics(input lyrics.GetLyricsRequest) (lyrics.GetLyricsResponse, error) {
 	var empty lyrics.GetLyricsResponse
 	if !isOptInEnabled(configLyrics) {
@@ -319,12 +330,44 @@ func (a *neteaseMusicAgent) GetLyrics(input lyrics.GetLyricsRequest) (lyrics.Get
 		return empty, errLyricsNotFound
 	}
 
-	// The original lyrics come first; the Netease translation (when
-	// available) is always included as a second lang="zh" entry — the
-	// client decides which one to display.
+	return lyrics.GetLyricsResponse{Lyrics: buildLyricsEntries(lyric, getLyricsDisplayMode())}, nil
+}
+
+// getLyricsDisplayMode returns the configured lyrics display mode, defaulting
+// to displayModeOriginal when unset or unknown.
+func getLyricsDisplayMode() string {
+	val, exists := host.ConfigGet(configLyricsDisplayMode)
+	if !exists {
+		return displayModeOriginal
+	}
+	switch val {
+	case displayModeBilingual, displayModeChinese:
+		return val
+	default:
+		return displayModeOriginal
+	}
+}
+
+// buildLyricsEntries shapes the cached lyric parts according to the display
+// mode. Bilingual merges original and translation onto one timeline as
+// "原文（译文）"; Chinese returns only the translation. Both fall back to the
+// default original behavior when no translation exists. The default mode
+// sends the original first and the Netease translation (when available) as a
+// second lang="zh" entry — the client decides which one to display.
+func buildLyricsEntries(lyric *cachedLyrics, mode string) []lyrics.LyricsText {
+	switch mode {
+	case displayModeBilingual:
+		if lyric.Translated != "" {
+			return []lyrics.LyricsText{{Text: mergeLrcByTimeline(lyric.Text, lyric.Translated)}}
+		}
+	case displayModeChinese:
+		if lyric.Translated != "" {
+			return []lyrics.LyricsText{{Text: lyric.Translated}}
+		}
+	}
 	out := []lyrics.LyricsText{{Text: lyric.Text}}
 	if lyric.Translated != "" {
 		out = append(out, lyrics.LyricsText{Lang: "zh", Text: lyric.Translated})
 	}
-	return lyrics.GetLyricsResponse{Lyrics: out}, nil
+	return out
 }

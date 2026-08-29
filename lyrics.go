@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/navidrome/navidrome/plugins/pdk/go/pdk"
@@ -80,6 +82,96 @@ func formatLrcTimestamp(ms int) string {
 	return fmt.Sprintf("[%02d:%02d.%02d]", minutes, seconds, centis)
 }
 
+// mergeLrcByTimeline 把原文 LRC 与中文翻译按时间轴合并为单条歌词:
+// 时间戳一致的行合并为"原文（译文）",原文独有的行原样保留,翻译独有
+// 的行丢弃(网易云 lrc/tlyric 时间戳基本精确对齐)。时间戳精度差异
+// ([00:01.00] 与 [00:01.000])视为同一时间。翻译没有任何时间标签时,
+// 无法对齐,直接返回原文。
+func mergeLrcByTimeline(original, translated string) string {
+	// 部分上游部署可能返回 CRLF 行尾,先归一为 \n,避免 \r 残留在
+	// 合并行中间("text\r（译文）")。
+	original = normalizeLrcNewlines(original)
+	translated = normalizeLrcNewlines(translated)
+
+	transByMs := translationByTimestamp(translated)
+	if len(transByMs) == 0 {
+		return original
+	}
+
+	lines := strings.Split(original, "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		prefix, text, ms, ok := splitLrcTags(line)
+		text = strings.TrimSpace(text)
+		if ok && text != "" {
+			if trans, found := transByMs[ms]; found {
+				line = prefix + text + "（" + trans + "）"
+			}
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
+}
+
+// normalizeLrcNewlines 把 \r\n 与孤立的 \r 统一为 \n。
+func normalizeLrcNewlines(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	return strings.ReplaceAll(s, "\r", "\n")
+}
+
+// translationByTimestamp 把翻译 LRC 解析为 时间戳(毫秒)→文本 的映射。
+// 无时间标签或文本为空的行跳过;同一时间戳取第一行。
+func translationByTimestamp(raw string) map[int64]string {
+	result := map[int64]string{}
+	for _, line := range strings.Split(raw, "\n") {
+		_, text, ms, ok := splitLrcTags(line)
+		if !ok || strings.TrimSpace(text) == "" {
+			continue
+		}
+		if _, dup := result[ms]; !dup {
+			result[ms] = strings.TrimSpace(text)
+		}
+	}
+	return result
+}
+
+// lrcTagPattern matches a leading LRC time tag like [mm:ss.xx] / [mm:ss.xxx].
+var lrcTagPattern = regexp.MustCompile(`^\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]`)
+
+// splitLrcTags 拆出 LRC 行开头的全部时间标签。返回标签前缀(原样)、
+// 剩余文本、第一个标签的毫秒数,以及是否存在时间标签。
+func splitLrcTags(line string) (prefix, text string, ms int64, ok bool) {
+	rest := line
+	var firstMs int64
+	hadTag := false
+	for {
+		m := lrcTagPattern.FindStringSubmatch(rest)
+		if m == nil {
+			break
+		}
+		minutes, _ := strconv.ParseInt(m[1], 10, 64)
+		seconds, _ := strconv.ParseInt(m[2], 10, 64)
+		var frac int64
+		switch len(m[3]) {
+		case 1: // .x → 百毫秒
+			frac, _ = strconv.ParseInt(m[3], 10, 64)
+			frac *= 100
+		case 2: // .xx → 厘秒
+			frac, _ = strconv.ParseInt(m[3], 10, 64)
+			frac *= 10
+		case 3: // .xxx → 毫秒
+			frac, _ = strconv.ParseInt(m[3], 10, 64)
+		}
+		if !hadTag {
+			firstMs = minutes*60000 + seconds*1000 + frac
+			hadTag = true
+		}
+		prefix += rest[:len(m[0])]
+		rest = rest[len(m[0]):]
+	}
+	return prefix, rest, firstMs, hadTag
+}
+
 // neteaseSongSearchResponse maps /search?type=1 (songs).
 type neteaseSongSearchResponse struct {
 	Code   int `json:"code"`
@@ -140,9 +232,9 @@ type cachedLyrics struct {
 }
 
 // resolveSongID maps an artist:title pair to a Netease song ID via
-// /search?type=1. Results are cached with the configured TTL (song matching
-// is fuzzier than artist matching, so entries expire instead of living
-// forever); "not found" is negative-cached for 2h to throttle retries.
+// /search?type=1. Results are cached with the configured lyrics TTL (song
+// matching is fuzzier than artist matching, so entries expire instead of
+// living forever); "not found" is negative-cached for 2h to throttle retries.
 func resolveSongID(artistName, title string) (int64, error) {
 	cacheKey := "song:" + normalizeName(artistName) + ":" + normalizeName(title)
 
@@ -171,7 +263,7 @@ func resolveSongID(artistName, title string) (int64, error) {
 		return 0, nil
 	}
 
-	if err := kvSetWithTTL(cacheKey, cachedSongID{SongID: song.ID}, getCacheTTLSeconds()); err != nil {
+	if err := kvSetWithTTL(cacheKey, cachedSongID{SongID: song.ID}, getLyricsCacheTTLSeconds()); err != nil {
 		pdk.Log(pdk.LogWarn, "failed to cache song ID: "+err.Error())
 	} else {
 		pdk.Log(pdk.LogDebug, fmt.Sprintf("cached song ID: %s → %d", cacheKey, song.ID))
@@ -206,9 +298,9 @@ func containsFold(s, substr string) bool {
 // fetchLyrics returns the song's lyrics (and Chinese translation when
 // available) from /lyric/new, falling back to the classic /lyric endpoint
 // for older NeteaseCloudMusicApi deployments. Results (including "no
-// lyrics") are cached with the configured TTL. trackPath (the library-
-// relative path of the requesting track, when available) is recorded in the
-// cache so external tools can write the lyrics back to the source file.
+// lyrics") are cached with the configured lyrics TTL. trackPath (the
+// library-relative path of the requesting track, when available) is recorded
+// in the cache so external tools can write the lyrics back to the source file.
 func fetchLyrics(songID int64, trackPath string) (*cachedLyrics, error) {
 	cacheKey := fmt.Sprintf("lyrics:%d", songID)
 
@@ -240,7 +332,7 @@ func fetchLyrics(songID int64, trackPath string) (*cachedLyrics, error) {
 			Translated: normalizeLrc(lyricResp.Tlyric.Lyric),
 			Path:       trackPath,
 		}
-		if err := kvSetWithTTL(cacheKey, lyrics, getCacheTTLSeconds()); err != nil {
+		if err := kvSetWithTTL(cacheKey, lyrics, getLyricsCacheTTLSeconds()); err != nil {
 			pdk.Log(pdk.LogWarn, "failed to cache lyrics: "+err.Error())
 		} else {
 			pdk.Log(pdk.LogDebug, fmt.Sprintf("cached lyrics: %s", cacheKey))
@@ -250,7 +342,7 @@ func fetchLyrics(songID int64, trackPath string) (*cachedLyrics, error) {
 
 	// No lyrics on either endpoint: negative-cache to avoid refetching.
 	pdk.Log(pdk.LogDebug, fmt.Sprintf("no lyrics found for song %d", songID))
-	if err := kvSetWithTTL(cacheKey, cachedLyrics{}, getCacheTTLSeconds()); err != nil {
+	if err := kvSetWithTTL(cacheKey, cachedLyrics{}, getLyricsCacheTTLSeconds()); err != nil {
 		pdk.Log(pdk.LogWarn, "failed to cache negative lyrics: "+err.Error())
 	}
 	return &cachedLyrics{}, nil

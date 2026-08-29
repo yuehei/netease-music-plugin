@@ -67,8 +67,34 @@
         "enable_lyrics": {
           "type": "boolean",
           "title": "Lyrics",
-          "description": "通过歌名+歌手搜索单曲并抓取 LRC 歌词，搜索与歌词均按缓存时间缓存。原文为第一条；网易云有中文翻译时，翻译作为第二条（lang=zh）一并下发，由客户端决定展示哪条。",
+          "description": "通过歌名+歌手搜索单曲并抓取 LRC 歌词，搜索与歌词均按歌词缓存时间缓存。展示形态由下方\"歌词显示方式\"决定（默认：原文第一条；翻译作为第二条 lang=zh 下发，由客户端决定展示哪条）。",
           "default": false
+        },
+        "lyrics_display_mode": {
+          "type": "string",
+          "title": "歌词显示方式",
+          "description": "原文：原文与中文翻译各一条，由客户端选择展示（默认）。原文+中文翻译：按时间轴把翻译合并进原文，输出单条\"原文（译文）\"。中文：仅输出中文翻译。后两种在网易云没有提供翻译时自动回退为原文方式。",
+          "default": "original",
+          "oneOf": [
+            {
+              "const": "original",
+              "title": "原文"
+            },
+            {
+              "const": "bilingual",
+              "title": "原文+中文翻译"
+            },
+            {
+              "const": "chinese",
+              "title": "中文"
+            }
+          ]
+        },
+        "lyrics_cache_ttl_days": {
+          "type": "integer",
+          "title": "歌词缓存时间（天）",
+          "description": "单曲搜索结果与歌词的缓存天数，独立于上方通用缓存时间；过期后重新抓取。",
+          "default": 7
         },
         "enable_album_images": {
           "type": "boolean",
@@ -136,6 +162,30 @@
         },
         {
           "type": "Label",
+          "text": "Lyrics"
+        },
+        {
+          "type": "HorizontalLayout",
+          "elements": [
+            {
+              "type": "Control",
+              "scope": "#/properties/lyrics_display_mode",
+              "options": {
+                "showUnfocusedDescription": true,
+                "size": 9
+              }
+            },
+            {
+              "type": "Control",
+              "scope": "#/properties/lyrics_cache_ttl_days",
+              "options": {
+                "size": 3
+              }
+            }
+          ]
+        },
+        {
+          "type": "Label",
           "text": "Capabilities"
         },
         {
@@ -195,7 +245,7 @@
     },
     "kvstore": {
       "reason": "Cache artist ID mappings and fetched metadata to reduce API calls",
-      "maxSize": "10MB"
+      "maxSize": "100MB"
     },
     "cache": {
       "reason": "Share the parsed artist ID overrides file and its change-check timestamp across plugin instances"
