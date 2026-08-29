@@ -79,13 +79,14 @@ Access the plugin configuration in Navidrome: **Settings > Plugins > 网易云�
 #### 艺术家 ID 映射文件
 - **默认值**：*（空）*
 - **说明**：音乐库内一个 JSON 文件的**相对路径**（如 `meta/artist-ids.json`），固定从**默认音乐库**（library id = 1）读取。手工维护"艺术家名 → 网易云 ID"映射。命中的艺术家直接使用配置的 ID 并同步更新缓存，优先级高于自动搜索匹配
-- **文件格式**：键为艺术家名称，支持用英文分号 `;` 分隔多个别名（全部指向同一个 ID）；值为网易云艺术家 ID（数字或数字字符串），非法条目忽略
+- **文件格式**：键为艺术家名称，支持用英文分号 `;` 分隔多个别名（全部指向同一个 ID）；值为网易云艺术家 ID（数字或数字字符串），非法条目忽略。完整示例见 [example/artist-ids.json](example/artist-ids.json)
   ```json
   {
-    "周杰伦;Jay Chou": 6452,
-    "Radiohead": "72161"
+    "i-dle;G(idle);(G)I-DLE;G(I-DLE)": 14055085,
+    "Miyeon;曺薇娟;조미연": 15249075
   }
   ```
+- **名称匹配规则**：仅做**转小写 + 去首尾空白**两个归一化（`Miyeon` = `MIYEON` = ` miyeon `），**标点/括号/内部空格不归一化**（`G(idle)` ≠ `(G)I-DLE`）——库里标签是什么写法，就在别名里列出什么写法；全角半角、多艺术家组合（`A • B`）也不会拆分或转换
 - **动态加载**：Navidrome 插件没有"配置已保存"回调，插件采用等价策略：**保存插件配置**（路径变化）立即重新加载；**直接在音乐库里编辑该文件**后，最迟 60 秒内检测到 mtime/大小变化并自动重载。由于 Navidrome 为**每次插件调用创建新的 wasm 实例**（实例内存不共享），解析结果通过宿主的 Cache 服务（进程内存、按插件隔离、全实例共享，需要 `cache` 权限）保存——60 秒节流跨所有实例生效，正常解析不再重复读文件。检测到变动重载时会写一条 Info 日志（含新旧条目数），便于确认生效
 - **权限**：需要授予音乐库文件系统（只读）访问权限，并在启用插件时开启"允许所有媒体库"（Allow all libraries），否则无法读取该文件
 
@@ -197,6 +198,7 @@ The plugin implements seven metadata provider capabilities plus a lyrics capabil
 | [overrides.go](overrides.go)   | Artist ID overrides file loading (with aliases)   |
 | [helpers.go](helpers.go)       | Config, HTTP, and KV store helpers                |
 | [scripts/export_lyrics.py](scripts/export_lyrics.py) | 把缓存的歌词导出并写回音乐库（.lrc/标签） |
+| [example/artist-ids.json](example/artist-ids.json) | 艺术家 ID 映射文件示例（多别名写法） |
 | [manifest.json](manifest.json) | Plugin metadata and permission declarations       |
 | [Makefile](Makefile)           | Build automation                                  |
 
