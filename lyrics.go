@@ -1,0 +1,257 @@
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/url"
+	"strings"
+
+	"github.com/navidrome/navidrome/plugins/pdk/go/pdk"
+)
+
+// errLyricsNotFound signals "no lyrics for this track" to Navidrome, so it
+// can fall through to the next configured lyrics agent. The lyrics
+// capability returns values (not pointers), so an error is the only way to
+// report absence without ending the agent chain.
+var errLyricsNotFound = errors.New("lyrics not found")
+
+// metaLine 映射网易云混在 lrc 字段里的 JSON 元信息行,例如:
+//
+//	{"t":0,"c":[{"tx":"作词: "},{"tx":"宋冬野"}]}
+//
+// 这类行不是标准 LRC([mm:ss.xx]文本),Navidrome 的解析器会丢弃,
+// 导致作词/作曲/编曲等信息丢失。
+type metaLine struct {
+	T int `json:"t"` // 毫秒时间戳
+	C []struct {
+		Tx string `json:"tx"` // 文本片段,需按序拼接
+	} `json:"c"`
+}
+
+// normalizeLrc 清洗网易云 lrc 文本:把混入的 JSON 元信息行转换成标准
+// LRC 行([mm:ss.xx]文本),其余行原样保留。这样作词/作曲/编曲信息
+// 能被 Navidrome 正常解析显示。
+func normalizeLrc(raw string) string {
+	if !strings.Contains(raw, `"tx"`) {
+		return raw // 无 JSON 行,快速返回
+	}
+
+	lines := strings.Split(raw, "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "{") && strings.Contains(trimmed, `"tx"`) {
+			if converted, ok := convertMetaLine(trimmed); ok {
+				out = append(out, converted)
+				continue
+			}
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
+}
+
+// convertMetaLine 把单行 JSON 元信息转成标准 LRC 行,失败时返回 false。
+func convertMetaLine(line string) (string, bool) {
+	var m metaLine
+	if err := json.Unmarshal([]byte(line), &m); err != nil {
+		return "", false
+	}
+	var sb strings.Builder
+	for _, frag := range m.C {
+		sb.WriteString(frag.Tx)
+	}
+	text := strings.TrimSpace(sb.String())
+	if text == "" {
+		return "", false
+	}
+	return formatLrcTimestamp(m.T) + text, true
+}
+
+// formatLrcTimestamp 把毫秒转成 LRC 时间标签 [mm:ss.xx]。
+func formatLrcTimestamp(ms int) string {
+	if ms < 0 {
+		ms = 0
+	}
+	minutes := ms / 60000
+	seconds := (ms % 60000) / 1000
+	centis := (ms % 1000) / 10
+	return fmt.Sprintf("[%02d:%02d.%02d]", minutes, seconds, centis)
+}
+
+// neteaseSongSearchResponse maps /search?type=1 (songs).
+type neteaseSongSearchResponse struct {
+	Code   int `json:"code"`
+	Result struct {
+		Songs []neteaseSong `json:"songs"`
+	} `json:"result"`
+}
+
+type neteaseSong struct {
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
+	// /search returns `artists`; cloudsearch-style payloads use `ar`.
+	Artists []struct {
+		Name string `json:"name"`
+	} `json:"artists"`
+	Ar []struct {
+		Name string `json:"name"`
+	} `json:"ar"`
+}
+
+// neteaseLyricResponse maps /lyric/new (fallback: /lyric).
+type neteaseLyricResponse struct {
+	Code int `json:"code"`
+	Lrc  struct {
+		Lyric string `json:"lyric"`
+	} `json:"lrc"`
+	Tlyric struct {
+		Lyric string `json:"lyric"`
+	} `json:"tlyric"`
+}
+
+// firstArtistName returns the lead artist name, tolerating both the
+// `artists` and `ar` payload shapes.
+func (s *neteaseSong) firstArtistName() string {
+	if len(s.Artists) > 0 {
+		return s.Artists[0].Name
+	}
+	if len(s.Ar) > 0 {
+		return s.Ar[0].Name
+	}
+	return ""
+}
+
+// cachedSongID stores the resolved Netease song ID for an artist:title pair.
+// An empty SongID is a negative entry ("known to not exist").
+type cachedSongID struct {
+	SongID int64 `json:"songId"`
+}
+
+// cachedLyrics stores the fetched lyric parts for a song. An entry with an
+// empty Text is a valid (negative) cache entry. Path records the track's
+// library-relative path (from the lyrics request) so external tools can
+// write the lyrics back next to the source file.
+type cachedLyrics struct {
+	Text       string `json:"text,omitempty"`
+	Translated string `json:"translated,omitempty"`
+	Path       string `json:"path,omitempty"`
+}
+
+// resolveSongID maps an artist:title pair to a Netease song ID via
+// /search?type=1. Results are cached with the configured TTL (song matching
+// is fuzzier than artist matching, so entries expire instead of living
+// forever); "not found" is negative-cached for 2h to throttle retries.
+func resolveSongID(artistName, title string) (int64, error) {
+	cacheKey := "song:" + normalizeName(artistName) + ":" + normalizeName(title)
+
+	var cached cachedSongID
+	if kvGet(cacheKey, &cached) {
+		return cached.SongID, nil
+	}
+
+	keywords := strings.TrimSpace(artistName + " " + title)
+	path := fmt.Sprintf("/search?keywords=%s&type=1&limit=5", url.QueryEscape(keywords))
+
+	var searchResp neteaseSongSearchResponse
+	if err := apiGet(path, &searchResp); err != nil {
+		return 0, fmt.Errorf("Netease song search: %w", err)
+	}
+	if searchResp.Code != 200 {
+		return 0, fmt.Errorf("song search for '%s' returned code %d", keywords, searchResp.Code)
+	}
+
+	song := pickSongMatch(title, artistName, searchResp.Result.Songs)
+	if song == nil {
+		pdk.Log(pdk.LogDebug, "no song found for: "+keywords)
+		if err := kvSetWithTTL(cacheKey, cachedSongID{}, negativeCacheTTLSeconds); err != nil {
+			pdk.Log(pdk.LogWarn, "failed to cache negative song result: "+err.Error())
+		}
+		return 0, nil
+	}
+
+	if err := kvSetWithTTL(cacheKey, cachedSongID{SongID: song.ID}, getCacheTTLSeconds()); err != nil {
+		pdk.Log(pdk.LogWarn, "failed to cache song ID: "+err.Error())
+	} else {
+		pdk.Log(pdk.LogDebug, fmt.Sprintf("cached song ID: %s → %d", cacheKey, song.ID))
+	}
+	return song.ID, nil
+}
+
+// pickSongMatch selects the result whose title matches exactly (case
+// insensitive) and whose lead artist matches the queried artist, falling
+// back to the first result (Netease ranks by relevance).
+func pickSongMatch(title, artist string, songs []neteaseSong) *neteaseSong {
+	for i := range songs {
+		if !strings.EqualFold(songs[i].Name, title) {
+			continue
+		}
+		if artist == "" || containsFold(artist, songs[i].firstArtistName()) ||
+			containsFold(songs[i].firstArtistName(), artist) {
+			return &songs[i]
+		}
+	}
+	if len(songs) > 0 {
+		return &songs[0]
+	}
+	return nil
+}
+
+// containsFold reports whether s contains substr, case-insensitively.
+func containsFold(s, substr string) bool {
+	return strings.Contains(strings.ToLower(s), strings.ToLower(substr))
+}
+
+// fetchLyrics returns the song's lyrics (and Chinese translation when
+// available) from /lyric/new, falling back to the classic /lyric endpoint
+// for older NeteaseCloudMusicApi deployments. Results (including "no
+// lyrics") are cached with the configured TTL. trackPath (the library-
+// relative path of the requesting track, when available) is recorded in the
+// cache so external tools can write the lyrics back to the source file.
+func fetchLyrics(songID int64, trackPath string) (*cachedLyrics, error) {
+	cacheKey := fmt.Sprintf("lyrics:%d", songID)
+
+	var cached cachedLyrics
+	if kvGet(cacheKey, &cached) {
+		pdk.Log(pdk.LogDebug, "lyrics cache hit: "+cacheKey)
+		return &cached, nil
+	}
+
+	paths := []string{
+		fmt.Sprintf("/lyric/new?id=%d", songID),
+		fmt.Sprintf("/lyric?id=%d", songID),
+	}
+	for _, path := range paths {
+		var lyricResp neteaseLyricResponse
+		if err := apiGet(path, &lyricResp); err != nil {
+			return nil, fmt.Errorf("Netease lyrics: %w", err)
+		}
+		if lyricResp.Code != 200 {
+			pdk.Log(pdk.LogDebug, fmt.Sprintf("lyrics endpoint %s returned code %d for song %d", path, lyricResp.Code, songID))
+			continue
+		}
+		if strings.TrimSpace(lyricResp.Lrc.Lyric) == "" {
+			continue
+		}
+
+		lyrics := &cachedLyrics{
+			Text:       normalizeLrc(lyricResp.Lrc.Lyric),
+			Translated: normalizeLrc(lyricResp.Tlyric.Lyric),
+			Path:       trackPath,
+		}
+		if err := kvSetWithTTL(cacheKey, lyrics, getCacheTTLSeconds()); err != nil {
+			pdk.Log(pdk.LogWarn, "failed to cache lyrics: "+err.Error())
+		} else {
+			pdk.Log(pdk.LogDebug, fmt.Sprintf("cached lyrics: %s", cacheKey))
+		}
+		return lyrics, nil
+	}
+
+	// No lyrics on either endpoint: negative-cache to avoid refetching.
+	pdk.Log(pdk.LogDebug, fmt.Sprintf("no lyrics found for song %d", songID))
+	if err := kvSetWithTTL(cacheKey, cachedLyrics{}, getCacheTTLSeconds()); err != nil {
+		pdk.Log(pdk.LogWarn, "failed to cache negative lyrics: "+err.Error())
+	}
+	return &cachedLyrics{}, nil
+}

@@ -99,6 +99,7 @@ var _ = Describe("album", func() {
 		})
 
 		It("returns nil when the artist is not found", func() {
+			mockArtistMatchConfig()
 			host.KVStoreMock.On("Get", "album:nobody:范特西").Return([]byte(nil), false, nil)
 			host.KVStoreMock.On("Get", "artist:nobody").Return(mustMarshal(cachedArtistID{ArtistID: 0}), true, nil)
 

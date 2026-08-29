@@ -3,3 +3,6 @@
 tmp
 netease-music
 netease-music-plugin
+.DS_Store
+.idea/
+__pycache__/

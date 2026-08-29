@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
-	"sync"
 
 	"github.com/navidrome/navidrome/plugins/pdk/go/metadata"
 	"github.com/navidrome/navidrome/plugins/pdk/go/pdk"
@@ -78,20 +77,14 @@ func readCachedArtistID(cacheKey string) (int64, bool) {
 	return cached.ArtistID, true
 }
 
-// artistResolveCall tracks one in-flight resolveArtistID call. Concurrent
-// callers for the same artist wait on done and then share the leader's
-// result — success, "not found", AND failure — so a burst of capability
-// calls issues only one /search even when the upstream is rate-limiting.
-// The result lives only in memory for the current burst; nothing is
-// persisted, keeping the "no negative cache on rate limiting" rule.
-type artistResolveCall struct {
-	done chan struct{}
-	id   int64
-	err  error
-}
-
-// artistResolveInflight maps an artist cache key to its in-flight call.
-var artistResolveInflight sync.Map // string -> *artistResolveCall
+// Cross-instance search dedup is NOT attempted: Navidrome creates a new
+// wasm instance per plugin call, and its wazero config provides a real wall
+// clock but a virtual monotonic clock — time.Sleep advances the virtual
+// clock almost instantly (measured: 3s of virtual sleep = 32ms of real
+// time), so an instance cannot really wait for a concurrent leader's
+// result. Concurrent first resolutions therefore each issue their own
+// search (bounded by Navidrome's call concurrency, observed ≤2); the KV
+// cache collapses all later calls to a single entry.
 
 func resolveArtistID(artistName string) (int64, error) {
 	normalized := normalizeName(artistName)
@@ -101,31 +94,34 @@ func resolveArtistID(artistName string) (int64, error) {
 
 	// Check cache
 	cacheKey := "artist:" + normalized
+
+	// Manual overrides take precedence over both the cache (which may hold a
+	// wrong ID from an earlier fuzzy match) and search results, and refresh
+	// the cache so all capability paths use the corrected ID.
+	if id, ok := artistOverrideCache.get(normalized); ok {
+		if cachedID, cached := readCachedArtistID(cacheKey); !cached || cachedID != id {
+			if err := kvSet(cacheKey, cachedArtistID{ArtistID: id}); err != nil {
+				pdk.Log(pdk.LogWarn, "failed to cache override artist ID: "+err.Error())
+			} else {
+				pdk.Log(pdk.LogDebug, fmt.Sprintf("updated artist ID cache from override: %s → %d", cacheKey, id))
+			}
+		}
+		return id, nil
+	}
+
 	if id, ok := readCachedArtistID(cacheKey); ok {
 		return id, nil
 	}
 
-	// Join or start the in-flight resolution for this artist.
-	call := &artistResolveCall{done: make(chan struct{})}
-	if actual, loaded := artistResolveInflight.LoadOrStore(cacheKey, call); loaded {
-		shared := actual.(*artistResolveCall)
-		<-shared.done
-		return shared.id, shared.err
-	}
-
-	// Leader: LIFO defers close(done) before deleting the map entry, so
-	// waiters always observe the published result.
-	defer artistResolveInflight.Delete(cacheKey)
-	defer close(call.done)
-	call.id, call.err = resolveArtistIDFetch(cacheKey, artistName, normalized)
-	return call.id, call.err
+	return resolveArtistIDFetch(cacheKey, artistName, normalized)
 }
 
 // resolveArtistIDFetch performs the actual /search lookup and cache writes.
-// Called only by the resolveArtistID leader.
+// The caller has already missed both the override and the KV cache.
 func resolveArtistIDFetch(cacheKey, artistName, normalized string) (int64, error) {
-	// Double-check: a just-finished leader may have populated the cache
-	// between our fast-path check and becoming the leader.
+	// Double-check: a concurrent instance may have populated the cache in
+	// the meantime (cross-instance waiting is not possible — see the note
+	// above resolveArtistID).
 	if id, ok := readCachedArtistID(cacheKey); ok {
 		return id, nil
 	}
@@ -160,6 +156,18 @@ func resolveArtistIDFetch(cacheKey, artistName, normalized string) (int64, error
 
 	// Find best match by name similarity
 	bestMatch := findBestArtistMatch(artistName, searchResp.Result.Artists)
+
+	// With exact-match-only enabled, a fuzzy fallback is not acceptable:
+	// skip (0, nil) so Navidrome falls through to the next agent (e.g.
+	// last.fm / ListenBrainz) instead of caching a possibly-wrong artist ID.
+	// Pairing this switch with a second agent yields better overall match
+	// accuracy: Netease only supplies IDs for names it can match exactly,
+	// and everything else is scraped by the agent that handles it best.
+	if bestMatch != nil && isOptInEnabled(configArtistExactMatch) && normalizeName(bestMatch.Name) != normalized {
+		pdk.Log(pdk.LogInfo, fmt.Sprintf("no exact match for '%s' (exact-match-only enabled), skipping to next agent", artistName))
+		bestMatch = nil
+	}
+
 	if bestMatch == nil {
 		pdk.Log(pdk.LogDebug, "no matching artist found for: "+artistName)
 		if err := kvSetWithTTL(cacheKey, cachedArtistID{ArtistID: 0}, negativeCacheTTLSeconds); err != nil {

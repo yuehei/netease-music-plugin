@@ -2,7 +2,7 @@
   "$schema": "https://raw.githubusercontent.com/navidrome/navidrome/refs/heads/master/plugins/manifest-schema.json",
   "name": "网易云音乐元数据代理",
   "author": "yuehei",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "通过 NeteaseCloudMusicApi 兼容接口，从网易云音乐获取艺术家与专辑元数据",
   "website": "https://github.com/yuehei/netease-music-plugin",
   "config": {
@@ -26,6 +26,18 @@
           "title": "缓存时间（天）",
           "description": "拉取到的元数据缓存多少天后重新获取",
           "default": 7
+        },
+        "artist_exact_match": {
+          "type": "boolean",
+          "title": "艺术家全字匹配",
+          "description": "开启后，搜索结果中没有与艺术家名称完全一致（忽略大小写）的条目时，不再回退到第一个候选，而是跳过并由下一个 agent（如 last.fm / ListenBrainz）继续刮削。与第二个 agent 配合使用匹配更准：网易云只提供能精确匹配的 ID，其余交给下一个 agent，避免本插件缓存错误的艺术家 ID。已匹配错误的艺术家可用下方映射文件手工纠正。",
+          "default": false
+        },
+        "artist_id_overrides": {
+          "type": "string",
+          "title": "艺术家 ID 映射文件",
+          "description": "音乐库内 JSON 文件的相对路径，文件必须放在默认音乐库（library id = 1）中，如 meta/artist-ids.json。需要授予插件\"允许所有媒体库\"（Allow all libraries）权限，否则无法读取该文件。文件格式：键为艺术家名称，支持用英文分号分隔多个别名（如 \"周杰伦;Jay Chou\"），值为网易云艺术家 ID（数字或数字字符串）。保存插件配置或修改文件后自动重新加载，命中的艺术家直接使用配置的 ID 并同步更新缓存，优先级高于自动搜索匹配。示例：{\"周杰伦;Jay Chou\": 6452}。提示：上方\"艺术家全字匹配\"开启后，搜索无完全一致（忽略大小写）的艺术家时本插件直接跳过，由下一个 agent（如 last.fm / ListenBrainz）继续刮削；已匹配错误的艺术家可用本文件手工纠正。",
+          "default": ""
         },
         "enable_artist_url": {
           "type": "boolean",
@@ -51,6 +63,12 @@
           "type": "boolean",
           "title": "Top Songs",
           "default": true
+        },
+        "enable_lyrics": {
+          "type": "boolean",
+          "title": "Lyrics",
+          "description": "通过歌名+歌手搜索单曲并抓取 LRC 歌词，搜索与歌词均按缓存时间缓存。原文为第一条；网易云有中文翻译时，翻译作为第二条（lang=zh）一并下发，由客户端决定展示哪条。",
+          "default": false
         },
         "enable_album_images": {
           "type": "boolean",
@@ -95,6 +113,29 @@
         },
         {
           "type": "Label",
+          "text": "Artist Matching"
+        },
+        {
+          "type": "HorizontalLayout",
+          "elements": [
+            {
+              "type": "Control",
+              "scope": "#/properties/artist_exact_match",
+              "options": {
+                "showUnfocusedDescription": true
+              }
+            }
+          ]
+        },
+        {
+          "type": "Control",
+          "scope": "#/properties/artist_id_overrides",
+          "options": {
+            "showUnfocusedDescription": true
+          }
+        },
+        {
+          "type": "Label",
           "text": "Capabilities"
         },
         {
@@ -134,8 +175,11 @@
               "scope": "#/properties/enable_album_info"
             },
             {
-              "type": "Label",
-              "text": ""
+              "type": "Control",
+              "scope": "#/properties/enable_lyrics",
+              "options": {
+                "showUnfocusedDescription": true
+              }
             }
           ]
         }
@@ -152,6 +196,13 @@
     "kvstore": {
       "reason": "Cache artist ID mappings and fetched metadata to reduce API calls",
       "maxSize": "10MB"
+    },
+    "cache": {
+      "reason": "Share the parsed artist ID overrides file and its change-check timestamp across plugin instances"
+    },
+    "library": {
+      "reason": "Read the user-maintained artist ID overrides JSON file from the music library",
+      "filesystem": true
     }
   }
 }

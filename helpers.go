@@ -140,6 +140,14 @@ func isEnabled(key string) bool {
 	return !exists || val != "false"
 }
 
+// isOptInEnabled checks if an opt-in switch is enabled. Defaults to false —
+// for toggles whose manifest default is false (artist_exact_match, lyrics):
+// they must be explicitly turned on to take effect.
+func isOptInEnabled(key string) bool {
+	val, exists := host.ConfigGet(key)
+	return exists && val == "true"
+}
+
 func getCacheTTLSeconds() int64 {
 	days, exists := host.ConfigGetInt(configCacheTTLDays)
 	if !exists || days <= 0 {

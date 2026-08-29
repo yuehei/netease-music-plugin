@@ -4,7 +4,9 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"strings"
 
+	"github.com/navidrome/navidrome/plugins/pdk/go/lyrics"
 	"github.com/navidrome/navidrome/plugins/pdk/go/metadata"
 	"github.com/navidrome/navidrome/plugins/pdk/go/pdk"
 )
@@ -36,14 +38,17 @@ const (
 	negativeCacheTTLSeconds = 7200 // 2 hours
 
 	// Config keys
-	configAPIEndpoints    = "api_endpoints"
-	configMusicU          = "music_u"
-	configCacheTTLDays    = "cache_ttl_days"
-	configArtistURL       = "enable_artist_url"
+	configAPIEndpoints     = "api_endpoints"
+	configMusicU           = "music_u"
+	configCacheTTLDays     = "cache_ttl_days"
+	configArtistExactMatch = "artist_exact_match"
+	configArtistIDOverride = "artist_id_overrides"
+	configArtistURL        = "enable_artist_url"
 	configArtistBiography = "enable_artist_biography"
 	configArtistImages    = "enable_artist_images"
 	configSimilarArtists  = "enable_similar_artists"
 	configTopSongs        = "enable_top_songs"
+	configLyrics          = "enable_lyrics"
 	configAlbumImages     = "enable_album_images"
 	configAlbumInfo       = "enable_album_info"
 )
@@ -57,10 +62,12 @@ var (
 	_ metadata.ArtistTopSongsProvider  = (*neteaseMusicAgent)(nil)
 	_ metadata.AlbumImagesProvider     = (*neteaseMusicAgent)(nil)
 	_ metadata.AlbumInfoProvider       = (*neteaseMusicAgent)(nil)
+	_ lyrics.Lyrics                    = (*neteaseMusicAgent)(nil)
 )
 
 func init() {
 	metadata.Register(&neteaseMusicAgent{})
+	lyrics.Register(&neteaseMusicAgent{})
 }
 
 func main() {}
@@ -278,4 +285,46 @@ func (a *neteaseMusicAgent) GetAlbumInfo(input metadata.AlbumRequest) (*metadata
 		pdk.Log(pdk.LogWarn, "failed to cache album info: "+err.Error())
 	}
 	return resp, nil
+}
+
+// GetLyrics returns the track's lyrics from Netease Cloud Music as LRC text,
+// optionally with the Chinese translation as a second entry. The song is
+// located by artist:title search and both the song ID and the lyrics are
+// cached with the configured TTL. When no lyrics exist, errLyricsNotFound
+// lets Navidrome fall through to the next lyrics agent.
+func (a *neteaseMusicAgent) GetLyrics(input lyrics.GetLyricsRequest) (lyrics.GetLyricsResponse, error) {
+	var empty lyrics.GetLyricsResponse
+	if !isOptInEnabled(configLyrics) {
+		return empty, nil
+	}
+
+	title := strings.TrimSpace(input.Track.Title)
+	if title == "" {
+		return empty, errLyricsNotFound
+	}
+
+	songID, err := resolveSongID(input.Track.Artist, title)
+	if err != nil {
+		return empty, err
+	}
+	if songID == 0 {
+		return empty, errLyricsNotFound
+	}
+
+	lyric, err := fetchLyrics(songID, input.Track.Path)
+	if err != nil {
+		return empty, err
+	}
+	if lyric.Text == "" {
+		return empty, errLyricsNotFound
+	}
+
+	// The original lyrics come first; the Netease translation (when
+	// available) is always included as a second lang="zh" entry — the
+	// client decides which one to display.
+	out := []lyrics.LyricsText{{Text: lyric.Text}}
+	if lyric.Translated != "" {
+		out = append(out, lyrics.LyricsText{Lang: "zh", Text: lyric.Translated})
+	}
+	return lyrics.GetLyricsResponse{Lyrics: out}, nil
 }

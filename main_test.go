@@ -16,6 +16,7 @@ import (
 // setupArtistCache pre-caches the Taylor Swift artist ID and configures the
 // TTL mock used by most capability method tests.
 func setupArtistCache() {
+	mockArtistMatchConfig()
 	host.KVStoreMock.On("Get", "artist:taylor swift").Return(
 		mustMarshal(cachedArtistID{ArtistID: testArtistID}), true, nil,
 	)
